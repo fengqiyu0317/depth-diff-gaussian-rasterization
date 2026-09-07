@@ -18,6 +18,18 @@ def cpu_deep_copy_tuple(input_tuple):
     copied_tensors = [item.cpu().clone() if isinstance(item, torch.Tensor) else item for item in input_tuple]
     return tuple(copied_tensors)
 
+
+def tacker_capabilities():
+    """Return the compiled Raster+head ABI, or an explicit legacy marker."""
+
+    if not hasattr(_C, "tacker_capabilities"):
+        return {
+            "stream_aware": False,
+            "mixed_render_head_abi": 0,
+            "reason": "installed extension predates the Tacker mixed ABI",
+        }
+    return dict(_C.tacker_capabilities())
+
 def rasterize_gaussians(
     means3D,
     means2D,
@@ -220,3 +232,113 @@ class GaussianRasterizer(nn.Module):
             raster_settings, 
         )
 
+    def forward_with_head(
+        self,
+        means3D,
+        means2D,
+        opacities,
+        head_input,
+        head_weight,
+        head_bias,
+        shs=None,
+        colors_precomp=None,
+        scales=None,
+        rotations=None,
+        cov3D_precomp=None,
+        persistent_blocks=0,
+    ):
+        """Inference-only physical fusion of Raster and one 128x128 head.
+
+        ``head_input`` and ``head_weight`` are contiguous CUDA FP16 tensors;
+        ``head_bias`` is contiguous CUDA FP32.  The returned head tensor is
+        FP32 and implements ``head_input @ head_weight.T + head_bias``.
+        ``means2D`` is retained for call-site compatibility but is not part of
+        the inference-only C++ ABI.
+        """
+
+        if torch.is_grad_enabled():
+            raise RuntimeError(
+                "GaussianRasterizer.forward_with_head is inference-only; "
+                "call it under torch.no_grad()"
+            )
+        if not hasattr(_C, "rasterize_gaussians_with_head"):
+            raise RuntimeError(
+                "installed diff_gaussian_rasterization extension does not "
+                "provide the Tacker mixed ABI; rebuild the extension"
+            )
+        if not isinstance(persistent_blocks, int) or isinstance(
+            persistent_blocks, bool
+        ):
+            raise TypeError("persistent_blocks must be an int")
+        if persistent_blocks < 0:
+            raise ValueError("persistent_blocks must be >= 0")
+
+        if (shs is None and colors_precomp is None) or (
+            shs is not None and colors_precomp is not None
+        ):
+            raise Exception(
+                "Please provide exactly one of either SHs or precomputed colors!"
+            )
+        if (
+            (scales is None or rotations is None) and cov3D_precomp is None
+        ) or (
+            (scales is not None or rotations is not None)
+            and cov3D_precomp is not None
+        ):
+            raise Exception(
+                "Please provide exactly one of either scale/rotation pair or "
+                "precomputed 3D covariance!"
+            )
+
+        # Unlike the legacy autograd path, keep placeholders on the raster
+        # tensor's device.  They remain empty and are never dereferenced.
+        empty = means3D.new_empty((0,))
+        if shs is None:
+            shs = empty
+        if colors_precomp is None:
+            colors_precomp = empty
+        if scales is None:
+            scales = empty
+        if rotations is None:
+            rotations = empty
+        if cov3D_precomp is None:
+            cov3D_precomp = empty
+
+        raster_settings = self.raster_settings
+        args = (
+            raster_settings.bg,
+            means3D,
+            colors_precomp,
+            opacities,
+            scales,
+            rotations,
+            raster_settings.scale_modifier,
+            cov3D_precomp,
+            raster_settings.viewmatrix,
+            raster_settings.projmatrix,
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            raster_settings.image_height,
+            raster_settings.image_width,
+            shs,
+            raster_settings.sh_degree,
+            raster_settings.campos,
+            raster_settings.prefiltered,
+            raster_settings.debug,
+            head_input,
+            head_weight,
+            head_bias,
+            persistent_blocks,
+        )
+
+        (
+            _num_rendered,
+            color,
+            depth,
+            radii,
+            _geom_buffer,
+            _binning_buffer,
+            _image_buffer,
+            head_output,
+        ) = _C.rasterize_gaussians_with_head(*args)
+        return color, radii, depth, head_output

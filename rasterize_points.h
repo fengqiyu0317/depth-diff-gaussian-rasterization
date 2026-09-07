@@ -11,6 +11,7 @@
 
 #pragma once
 #include <torch/extension.h>
+#include <cstdint>
 #include <cstdio>
 #include <tuple>
 #include <string>
@@ -36,6 +37,35 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& campos,
 	const bool prefiltered,
 	const bool debug);
+
+// Inference-only Raster+deformation-head mixed path.  The first seven return
+// values have exactly the same order and meaning as RasterizeGaussiansCUDA;
+// the eighth is the FP32 [N, 128] head output.
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeGaussiansWithHeadCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& means3D,
+    const torch::Tensor& colors,
+    const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+    const int image_height,
+    const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const bool debug,
+	const torch::Tensor& head_input,
+	const torch::Tensor& head_weight,
+	const torch::Tensor& head_bias,
+	const int64_t persistent_blocks);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(

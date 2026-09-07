@@ -9,26 +9,52 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
+from pathlib import Path
+
 from setuptools import setup
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
-import os
-os.path.dirname(os.path.abspath(__file__))
+
+
+ROOT = Path(__file__).resolve().parent
+GLM_INCLUDE = ROOT / "third_party" / "glm"
+HEAD_INCLUDE = Path(
+    os.environ.get(
+        "TACKER_4DGS_HEAD_INCLUDE",
+        str(ROOT.parent.parent / "tacker_ext" / "include"),
+    )
+).resolve()
+
+if not (HEAD_INCLUDE / "head_linear_device.cuh").is_file():
+    raise RuntimeError(
+        "head_linear_device.cuh was not found; set TACKER_4DGS_HEAD_INCLUDE "
+        "to the 4DGaussians/tacker_ext/include directory"
+    )
+
+# The supported deployment machine is RTX A6000 (Ampere, SM 8.6).  Keep the
+# produced binary consistent with the `sm_target` capability field.
+os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"
 
 setup(
     name="diff_gaussian_rasterization",
-    packages=['diff_gaussian_rasterization'],
+    packages=["diff_gaussian_rasterization"],
     ext_modules=[
         CUDAExtension(
             name="diff_gaussian_rasterization._C",
             sources=[
-            "cuda_rasterizer/rasterizer_impl.cu",
-            "cuda_rasterizer/forward.cu",
-            "cuda_rasterizer/backward.cu",
-            "rasterize_points.cu",
-            "ext.cpp"],
-            extra_compile_args={"nvcc": ["-I" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party/glm/")]})
-        ],
-    cmdclass={
-        'build_ext': BuildExtension
-    }
+                str(ROOT / "cuda_rasterizer" / "rasterizer_impl.cu"),
+                str(ROOT / "cuda_rasterizer" / "forward.cu"),
+                str(ROOT / "cuda_rasterizer" / "backward.cu"),
+                str(ROOT / "cuda_rasterizer" / "tacker_mixed.cu"),
+                str(ROOT / "rasterize_points.cu"),
+                str(ROOT / "ext.cpp"),
+            ],
+            include_dirs=[str(GLM_INCLUDE), str(HEAD_INCLUDE)],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "-lineinfo", "-Xptxas=-v"],
+            },
+        )
+    ],
+    cmdclass={"build_ext": BuildExtension},
 )

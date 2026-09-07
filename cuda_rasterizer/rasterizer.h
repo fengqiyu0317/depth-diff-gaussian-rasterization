@@ -14,9 +14,25 @@
 
 #include <vector>
 #include <functional>
+#include <cuda_runtime_api.h>
 
 namespace CudaRasterizer
 {
+	// Non-owning, inference-only description of the deformation-head work that
+	// may share the final raster CTA.  Keeping the operand pointers opaque here
+	// prevents the core rasterizer interface from depending on CUDA half types.
+	// The mixed launcher interprets input/weight as row-major FP16 tensors and
+	// bias/output as FP32 tensors.
+	struct MixedHeadTask
+	{
+		const void* input;
+		const void* weight;
+		const float* bias;
+		float* output;
+		int rows;
+		int persistent_blocks;
+	};
+
 	class Rasterizer
 	{
 	public:
@@ -26,7 +42,8 @@ namespace CudaRasterizer
 			float* means3D,
 			float* viewmatrix,
 			float* projmatrix,
-			bool* present);
+			bool* present,
+			cudaStream_t stream = nullptr);
 
 		static int forward(
 			std::function<char* (size_t)> geometryBuffer,
@@ -51,7 +68,38 @@ namespace CudaRasterizer
 			float* out_color,
 			float* out_depth,
 			int* radii = nullptr,
-			bool debug = false);
+			bool debug = false,
+			cudaStream_t stream = nullptr);
+
+		// Inference-only overload.  All preprocessing, scan, sort, and range
+		// construction are identical to forward(); only the final render leaf is
+		// replaced by one physical Raster+head mixed kernel.
+		static int forward(
+			std::function<char* (size_t)> geometryBuffer,
+			std::function<char* (size_t)> binningBuffer,
+			std::function<char* (size_t)> imageBuffer,
+			const int P, int D, int M,
+			const float* background,
+			const int width, int height,
+			const float* means3D,
+			const float* shs,
+			const float* colors_precomp,
+			const float* opacities,
+			const float* scales,
+			const float scale_modifier,
+			const float* rotations,
+			const float* cov3D_precomp,
+			const float* viewmatrix,
+			const float* projmatrix,
+			const float* cam_pos,
+			const float tan_fovx, float tan_fovy,
+			const bool prefiltered,
+			float* out_color,
+			float* out_depth,
+			int* radii,
+			bool debug,
+			cudaStream_t stream,
+			const MixedHeadTask* mixed_head);
 
 		static void backward(
 			const int P, int D, int M, int R,
@@ -84,7 +132,8 @@ namespace CudaRasterizer
 			float* dL_dsh,
 			float* dL_dscale,
 			float* dL_drot,
-			bool debug);
+			bool debug,
+			cudaStream_t stream = nullptr);
 	};
 };
 

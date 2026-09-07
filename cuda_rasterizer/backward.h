@@ -38,7 +38,8 @@ namespace BACKWARD
 		float4* dL_dconic2D,
 		float* dL_dopacity,
 		float* dL_dcolors,
-		float* dL_ddepths);
+		float* dL_ddepths,
+		cudaStream_t stream = nullptr);
 
 	void preprocess(
 		int P, int D, int M,
@@ -63,7 +64,8 @@ namespace BACKWARD
 		float* dL_dcov3D,
 		float* dL_dsh,
 		glm::vec3* dL_dscale,
-		glm::vec4* dL_drot);
+		glm::vec4* dL_drot,
+		cudaStream_t stream = nullptr);
 }
 
 #endif

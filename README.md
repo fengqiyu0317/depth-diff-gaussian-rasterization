@@ -2,6 +2,63 @@
 
 Used as the rasterization engine for the paper "3D Gaussian Splatting for Real-Time Rendering of Radiance Fields". If you can make use of it in your own research, please be so kind to cite us.
 
+## Tacker Raster+head inference ABI
+
+This checkout also provides an inference-only physical mixed leaf for the
+4DGaussians integration. `tacker_mix_render_head_v1` launches one 384-thread
+CTA split into Raster `[0, 256)` and deformation-head GEMM `[256, 384)`.
+Raster uses named barrier 1 with exactly 256 participants; the head adapter
+uses only warp-local synchronization. `persistent_blocks=0` queries and caches
+the active GPU's SM count.
+
+CUDA 11.1 is the minimum supported toolkit for this `sm_86` path; CUDA 11.6 is
+recommended for the target PyTorch 1.13/A6000 environment. Mixed head input,
+weight, and output pointers are required to be natively 32-byte aligned for
+WMMA. Normal CUDA allocator base tensors satisfy this without a copy, while a
+misaligned contiguous storage view is rejected.
+
+The Python entry point is
+`GaussianRasterizer.forward_with_head(...)`, which must be called under
+`torch.no_grad()`. It returns `(color, radii, depth, head_output)`, where the
+last tensor is FP32 and computes `FP16 input @ FP16 weight.T + FP32 bias` with
+FP32 accumulation. `tacker_capabilities()` reports the compiled ABI. See
+`abi/tacker_mixed_render_head_v1.json` for the machine-readable contract.
+The mixed C++ entry validates all Raster operands (including `[0]` placeholders)
+as same-device CUDA FP32 tensors and uses rank/shape rather than `numel()` to
+select SH versus precomputed colors and covariance versus scale/rotation. Thus
+real zero-row tensors such as `[0, M, 3]` remain distinguishable from omitted
+`[0]` placeholders.
+
+The legacy forward, visibility, and autograd backward paths enqueue every CUDA
+kernel on PyTorch's current stream. The small rendered-count host readback is a
+stream-local synchronization required to size the binning buffers; it is never
+a device-wide synchronization.
+
+CPU-only source contract tests do not import PyTorch:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m unittest tests.test_tacker_mixed_contract -v
+```
+
+After building the extension on `4A6000`, the CUDA boundary cases (native
+alignment and zero-row ranked alternatives) can be run with:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m unittest tests.test_tacker_mixed_cuda -v
+```
+
+The legacy training API has a separate GPU smoke test that renders one real
+Gaussian and runs autograd forward/backward on a non-default PyTorch stream:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m unittest \
+  tests.test_stream_aware_legacy_cuda -v
+```
+
+CUDA compilation, numerical comparison against the legacy Raster path, head
+reference checks, Raster QoS, and performance qualification must be run on the
+configured RTX A6000 server.
+
 <section class="section" id="BibTeX">
   <div class="container is-max-desktop content">
     <h2 class="title">BibTeX</h2>

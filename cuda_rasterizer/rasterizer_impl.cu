@@ -10,10 +10,13 @@
  */
 
 #include "rasterizer_impl.h"
+#include <climits>
+#include <cstdint>
 #include <iostream>
 #include <fstream>
 #include <algorithm>
 #include <numeric>
+#include <stdexcept>
 #include <cuda.h>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
@@ -26,9 +29,36 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
+namespace
+{
+	// The rasterizer needs the final scan value on the host to size its binning
+	// workspace.  Keep a tiny per-host-thread pinned buffer so the copy can be
+	// ordered on the caller's stream without introducing a device-wide fence.
+	struct PinnedRenderedCount
+	{
+		uint32_t* value = nullptr;
+		cudaError_t status = cudaSuccess;
+
+		PinnedRenderedCount()
+		{
+			status = cudaMallocHost(
+				reinterpret_cast<void**>(&value), sizeof(uint32_t));
+		}
+
+		~PinnedRenderedCount()
+		{
+			if (value != nullptr)
+				cudaFreeHost(value);
+		}
+	};
+
+	thread_local PinnedRenderedCount rendered_count;
+}
+
 #include "auxiliary.h"
 #include "forward.h"
 #include "backward.h"
+#include "tacker_mixed.h"
 
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
@@ -143,9 +173,10 @@ void CudaRasterizer::Rasterizer::markVisible(
 	float* means3D,
 	float* viewmatrix,
 	float* projmatrix,
-	bool* present)
+	bool* present,
+	cudaStream_t stream)
 {
-	checkFrustum << <(P + 255) / 256, 256 >> > (
+	checkFrustum << <(P + 255) / 256, 256, 0, stream >> > (
 		P,
 		means3D,
 		viewmatrix, projmatrix,
@@ -218,7 +249,63 @@ int CudaRasterizer::Rasterizer::forward(
 	float* out_color,
 	float* out_depth,
 	int* radii,
-	bool debug)
+	bool debug,
+	cudaStream_t stream)
+{
+	return forward(
+		geometryBuffer,
+		binningBuffer,
+		imageBuffer,
+		P, D, M,
+		background,
+		width, height,
+		means3D,
+		shs,
+		colors_precomp,
+		opacities,
+		scales,
+		scale_modifier,
+		rotations,
+		cov3D_precomp,
+		viewmatrix,
+		projmatrix,
+		cam_pos,
+		tan_fovx, tan_fovy,
+		prefiltered,
+		out_color,
+		out_depth,
+		radii,
+		debug,
+		stream,
+		nullptr);
+}
+
+int CudaRasterizer::Rasterizer::forward(
+	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> binningBuffer,
+	std::function<char* (size_t)> imageBuffer,
+	const int P, int D, int M,
+	const float* background,
+	const int width, int height,
+	const float* means3D,
+	const float* shs,
+	const float* colors_precomp,
+	const float* opacities,
+	const float* scales,
+	const float scale_modifier,
+	const float* rotations,
+	const float* cov3D_precomp,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const float* cam_pos,
+	const float tan_fovx, float tan_fovy,
+	const bool prefiltered,
+	float* out_color,
+	float* out_depth,
+	int* radii,
+	bool debug,
+	cudaStream_t stream,
+	const MixedHeadTask* mixed_head)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -270,16 +357,33 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.conic_opacity,
 		tile_grid,
 		geomState.tiles_touched,
-		prefiltered
+		prefiltered,
+		stream
 	), debug)
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
-	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P, stream), debug)
 
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
-	int num_rendered;
-	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+	if (rendered_count.status != cudaSuccess)
+		throw std::runtime_error(cudaGetErrorString(rendered_count.status));
+	const cudaError_t rendered_copy_status = cudaMemcpyAsync(
+		rendered_count.value,
+		geomState.point_offsets + P - 1,
+		sizeof(uint32_t),
+		cudaMemcpyDeviceToHost,
+		stream);
+	if (rendered_copy_status != cudaSuccess)
+		throw std::runtime_error(cudaGetErrorString(rendered_copy_status));
+	const cudaError_t rendered_sync_status = cudaStreamSynchronize(stream);
+	if (rendered_sync_status != cudaSuccess)
+		throw std::runtime_error(cudaGetErrorString(rendered_sync_status));
+	const uint32_t num_rendered_u32 = *rendered_count.value;
+	if (num_rendered_u32 > static_cast<uint32_t>(INT_MAX))
+		throw std::overflow_error(
+			"rendered Gaussian instance count exceeds the int32 Raster ABI");
+	const int num_rendered = static_cast<int>(num_rendered_u32);
 
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
@@ -287,7 +391,7 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
 	// and corresponding dublicated Gaussian indices to be sorted
-	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
+	duplicateWithKeys << <(P + 255) / 256, 256, 0, stream >> > (
 		P,
 		geomState.means2D,
 		geomState.depths,
@@ -306,13 +410,14 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.sorting_size,
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
 		binningState.point_list_unsorted, binningState.point_list,
-		num_rendered, 0, 32 + bit), debug)
+		num_rendered, 0, 32 + bit, stream), debug)
 
-	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
+	CHECK_CUDA(cudaMemsetAsync(imgState.ranges, 0,
+		tile_grid.x * tile_grid.y * sizeof(uint2), stream), debug);
 
 	// Identify start and end of per-tile workloads in sorted list
 	if (num_rendered > 0)
-		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
+		identifyTileRanges << <(num_rendered + 255) / 256, 256, 0, stream >> > (
 			num_rendered,
 			binningState.point_list_keys,
 			imgState.ranges);
@@ -320,20 +425,43 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
-	CHECK_CUDA(FORWARD::render(
-		tile_grid, block,
-		imgState.ranges,
-		binningState.point_list,
-		width, height,
-		geomState.means2D,
-		feature_ptr,
-		geomState.depths,
-		geomState.conic_opacity,
-		imgState.accum_alpha,
-		imgState.n_contrib,
-		background,
-		out_color,
-		out_depth), debug)
+	if (mixed_head != nullptr)
+	{
+		CHECK_CUDA(Tacker::launchMixedRenderHead(
+			tile_grid,
+			imgState.ranges,
+			binningState.point_list,
+			width, height,
+			geomState.means2D,
+			feature_ptr,
+			geomState.depths,
+			geomState.conic_opacity,
+			imgState.accum_alpha,
+			imgState.n_contrib,
+			background,
+			out_color,
+			out_depth,
+			*mixed_head,
+			stream), debug)
+	}
+	else
+	{
+		CHECK_CUDA(FORWARD::render(
+			tile_grid, block,
+			imgState.ranges,
+			binningState.point_list,
+			width, height,
+			geomState.means2D,
+			feature_ptr,
+			geomState.depths,
+			geomState.conic_opacity,
+			imgState.accum_alpha,
+			imgState.n_contrib,
+			background,
+			out_color,
+			out_depth,
+			stream), debug)
+	}
 
 	return num_rendered;
 }
@@ -371,7 +499,8 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dsh,
 	float* dL_dscale,
 	float* dL_drot,
-	bool debug)
+	bool debug,
+	cudaStream_t stream)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
@@ -412,7 +541,8 @@ void CudaRasterizer::Rasterizer::backward(
 		(float4*)dL_dconic,
 		dL_dopacity,
 		dL_dcolor,
-		dL_ddepth), debug)
+		dL_ddepth,
+		stream), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
@@ -440,5 +570,6 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dcov3D,
 		dL_dsh,
 		(glm::vec3*)dL_dscale,
-		(glm::vec4*)dL_drot), debug)
+		(glm::vec4*)dL_drot,
+		stream), debug)
 }
