@@ -33,6 +33,29 @@ namespace CudaRasterizer
 		int persistent_blocks;
 	};
 
+	// Source-level host contract for the mixed ABI v2.  The corresponding
+	// tacker_ext device descriptor deliberately has the same field order, but
+	// CUDA half types remain outside the core Rasterizer header.  Read-only
+	// operands may alias across tasks (the five deformation heads normally
+	// share one hidden activation); every output must be distinct.
+	static const int kMaxMixedHeadTasksV2 = 5;
+	struct MixedHeadTaskV2
+	{
+		const void* input;
+		const void* weight;
+		const float* bias;
+		float* output;
+		int rows;
+	};
+
+	struct MixedHeadBundleV2
+	{
+		MixedHeadTaskV2 tasks[kMaxMixedHeadTasksV2];
+		int task_count;
+		int worker_groups;
+		int persistent_blocks;
+	};
+
 	class Rasterizer
 	{
 	public:
@@ -100,6 +123,36 @@ namespace CudaRasterizer
 			bool debug,
 			cudaStream_t stream,
 			const MixedHeadTask* mixed_head);
+
+		// Internal v2 overload used by the multi-head Python binding.  Exactly
+		// one of mixed_head_v1 and mixed_heads_v2 may be non-null.
+		static int forward(
+			std::function<char* (size_t)> geometryBuffer,
+			std::function<char* (size_t)> binningBuffer,
+			std::function<char* (size_t)> imageBuffer,
+			const int P, int D, int M,
+			const float* background,
+			const int width, int height,
+			const float* means3D,
+			const float* shs,
+			const float* colors_precomp,
+			const float* opacities,
+			const float* scales,
+			const float scale_modifier,
+			const float* rotations,
+			const float* cov3D_precomp,
+			const float* viewmatrix,
+			const float* projmatrix,
+			const float* cam_pos,
+			const float tan_fovx, float tan_fovy,
+			const bool prefiltered,
+			float* out_color,
+			float* out_depth,
+			int* radii,
+			bool debug,
+			cudaStream_t stream,
+			const MixedHeadTask* mixed_head_v1,
+			const MixedHeadBundleV2* mixed_heads_v2);
 
 		static void backward(
 			const int P, int D, int M, int R,

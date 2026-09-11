@@ -39,8 +39,10 @@ target_include_directories(CudaRasterizer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cud
 set(TACKER_4DGS_HEAD_INCLUDE
 	"${CMAKE_CURRENT_SOURCE_DIR}/../../tacker_ext/include"
 	CACHE PATH "Directory containing head_linear_device.cuh")
-if(NOT EXISTS "${TACKER_4DGS_HEAD_INCLUDE}/head_linear_device.cuh")
-	message(FATAL_ERROR "Set TACKER_4DGS_HEAD_INCLUDE to tacker_ext/include")
+if(NOT EXISTS "${TACKER_4DGS_HEAD_INCLUDE}/head_linear_device.cuh" OR
+	NOT EXISTS "${TACKER_4DGS_HEAD_INCLUDE}/head_linear_v2_device.cuh")
+	message(FATAL_ERROR
+		"Set TACKER_4DGS_HEAD_INCLUDE to a tacker_ext/include with ABI v1 and v2")
 endif()
 target_include_directories(CudaRasterizer PRIVATE
 	third_party/glm

@@ -25,10 +25,13 @@ HEAD_INCLUDE = Path(
     )
 ).resolve()
 
-if not (HEAD_INCLUDE / "head_linear_device.cuh").is_file():
+if not (HEAD_INCLUDE / "head_linear_device.cuh").is_file() or not (
+    HEAD_INCLUDE / "head_linear_v2_device.cuh"
+).is_file():
     raise RuntimeError(
-        "head_linear_device.cuh was not found; set TACKER_4DGS_HEAD_INCLUDE "
-        "to the 4DGaussians/tacker_ext/include directory"
+        "head_linear_device.cuh and head_linear_v2_device.cuh are required; "
+        "set TACKER_4DGS_HEAD_INCLUDE to the 4DGaussians/tacker_ext/include "
+        "directory"
     )
 
 # The supported deployment machine is RTX A6000 (Ampere, SM 8.6).  Keep the

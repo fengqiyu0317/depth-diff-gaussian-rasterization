@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <tuple>
 #include <string>
+#include <vector>
 	
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
@@ -65,6 +66,36 @@ RasterizeGaussiansWithHeadCUDA(
 	const torch::Tensor& head_input,
 	const torch::Tensor& head_weight,
 	const torch::Tensor& head_bias,
+	const int64_t persistent_blocks);
+
+// Mixed ABI v2.  Raster return values retain their legacy order; the eighth
+// value is a task-ordered vector of distinct FP32 [N_i, 128] outputs.
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+	torch::Tensor, torch::Tensor, std::vector<torch::Tensor>>
+RasterizeGaussiansWithHeadsCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& means3D,
+	const torch::Tensor& colors,
+	const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+	const int image_height,
+	const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const bool debug,
+	const std::vector<torch::Tensor>& head_inputs,
+	const std::vector<torch::Tensor>& head_weights,
+	const std::vector<torch::Tensor>& head_biases,
+	const int64_t worker_groups,
 	const int64_t persistent_blocks);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

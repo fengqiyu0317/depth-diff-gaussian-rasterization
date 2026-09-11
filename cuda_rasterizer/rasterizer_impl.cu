@@ -307,6 +307,66 @@ int CudaRasterizer::Rasterizer::forward(
 	cudaStream_t stream,
 	const MixedHeadTask* mixed_head)
 {
+	return forward(
+		geometryBuffer,
+		binningBuffer,
+		imageBuffer,
+		P, D, M,
+		background,
+		width, height,
+		means3D,
+		shs,
+		colors_precomp,
+		opacities,
+		scales,
+		scale_modifier,
+		rotations,
+		cov3D_precomp,
+		viewmatrix,
+		projmatrix,
+		cam_pos,
+		tan_fovx, tan_fovy,
+		prefiltered,
+		out_color,
+		out_depth,
+		radii,
+		debug,
+		stream,
+		mixed_head,
+		nullptr);
+}
+
+int CudaRasterizer::Rasterizer::forward(
+	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> binningBuffer,
+	std::function<char* (size_t)> imageBuffer,
+	const int P, int D, int M,
+	const float* background,
+	const int width, int height,
+	const float* means3D,
+	const float* shs,
+	const float* colors_precomp,
+	const float* opacities,
+	const float* scales,
+	const float scale_modifier,
+	const float* rotations,
+	const float* cov3D_precomp,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const float* cam_pos,
+	const float tan_fovx, float tan_fovy,
+	const bool prefiltered,
+	float* out_color,
+	float* out_depth,
+	int* radii,
+	bool debug,
+	cudaStream_t stream,
+	const MixedHeadTask* mixed_head,
+	const MixedHeadBundleV2* mixed_heads)
+{
+	if (mixed_head != nullptr && mixed_heads != nullptr)
+		throw std::invalid_argument(
+			"mixed Raster launch cannot select ABI v1 and v2 simultaneously");
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
@@ -425,7 +485,26 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
-	if (mixed_head != nullptr)
+	if (mixed_heads != nullptr)
+	{
+		CHECK_CUDA(Tacker::launchMixedRenderHeads(
+			tile_grid,
+			imgState.ranges,
+			binningState.point_list,
+			width, height,
+			geomState.means2D,
+			feature_ptr,
+			geomState.depths,
+			geomState.conic_opacity,
+			imgState.accum_alpha,
+			imgState.n_contrib,
+			background,
+			out_color,
+			out_depth,
+			*mixed_heads,
+			stream), debug)
+	}
+	else if (mixed_head != nullptr)
 	{
 		CHECK_CUDA(Tacker::launchMixedRenderHead(
 			tile_grid,

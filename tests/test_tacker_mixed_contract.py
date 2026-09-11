@@ -1,7 +1,9 @@
 """Torch/CUDA-free source contract tests for the mixed Raster+head ABI."""
 
 import json
+import hashlib
 from pathlib import Path
+import re
 import unittest
 
 
@@ -10,6 +12,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def source(relative_path):
     return (ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def manifest_sha256(relative_path):
+    return hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest()
+
+
+def capability_sha256(extension, key):
+    match = re.search(
+        rf'capabilities\["{re.escape(key)}"\]\s*=\s*"([0-9a-f]{{64}})";',
+        extension,
+    )
+    if match is None:
+        raise AssertionError(f"missing SHA-256 capability {key!r}")
+    return match.group(1)
 
 
 class MixedKernelContractTest(unittest.TestCase):
@@ -41,8 +57,9 @@ class MixedKernelContractTest(unittest.TestCase):
     def test_zero_policy_queries_device_and_launch_check_is_async(self):
         cuda = source("cuda_rasterizer/tacker_mixed.cu")
         self.assertIn("cudaGetDeviceProperties", cuda)
-        self.assertIn("cached_sm_count", cuda)
+        self.assertIn("cached_properties", cuda)
         self.assertIn("cudaPeekAtLastError", cuda)
+        self.assertIn("(void)cudaGetLastError()", cuda)
         self.assertNotIn("cudaDeviceSynchronize", cuda)
         self.assertNotIn("physical_blocks = 68", cuda)
         self.assertNotIn("physical_blocks = 142", cuda)
@@ -62,6 +79,64 @@ class MixedKernelContractTest(unittest.TestCase):
         )
         self.assertEqual(manifest["subgroups"]["raster"]["named_barrier_id"], 1)
 
+    def test_v2_wrapper_supports_one_to_five_heads_and_dynamic_ctas(self):
+        header = source("cuda_rasterizer/tacker_mixed.h")
+        cuda = source("cuda_rasterizer/tacker_mixed.cu")
+        adapter = source("../../tacker_ext/include/head_linear_v2_device.cuh")
+        self.assertIn("kMixedMultiAbiVersion = 2", header)
+        self.assertIn("kMaxHeadTasksV2 = 5", header)
+        self.assertIn("kMaxMixedThreadsV2", header)
+        self.assertIn("tacker_mix_render_heads_v2", cuda)
+        self.assertIn("head_linear_multi_gptb_device", cuda)
+        self.assertIn("head_linear_multi_gptb_device", adapter)
+        self.assertIn(
+            "heads.worker_groups * kWorkerGroupThreadsV2", cuda
+        )
+        self.assertIn("heads.tasks[4]", cuda)
+
+    def test_v2_named_barriers_are_disjoint_and_never_cta_wide(self):
+        header = source("cuda_rasterizer/tacker_mixed.h")
+        cuda = source("cuda_rasterizer/tacker_mixed.cu")
+        self.assertIn("kRasterBarrierId = 1", header)
+        self.assertIn("kHeadDescriptorBarrierIdV2 = 2", header)
+        self.assertIn("backend_threads", cuda)
+        self.assertIn("shared_head_tasks", cuda)
+        self.assertNotIn("__syncthreads(", cuda)
+
+    def test_v2_manifest_matches_source_and_covers_c1_c2(self):
+        manifest_text = source("abi/tacker_mixed_render_heads_v2.json")
+        manifest = json.loads(manifest_text)
+        self.assertEqual(manifest["abi_version"], 2)
+        self.assertEqual(
+            manifest["global_kernel_symbol"], "tacker_mix_render_heads_v2"
+        )
+        self.assertEqual(manifest["limits"]["task_count"], [1, 5])
+        self.assertEqual(
+            manifest["physical_launch"]["thread_counts_by_worker_groups"],
+            {"1": 384, "2": 512, "3": 640, "4": 768, "5": 896},
+        )
+        self.assertEqual(
+            manifest["candidate_coverage"]["C1_head_names"],
+            ["pos", "scales", "rotations", "opacity", "shs"],
+        )
+        self.assertEqual(
+            manifest["candidate_coverage"]["required_dual_head_variant"][
+                "supported_worker_groups"
+            ],
+            [1, 2],
+        )
+        self.assertEqual(
+            manifest["subgroups"]["head_workers"][
+                "descriptor_named_barrier_id"
+            ],
+            2,
+        )
+        # Make the byte-level artifact consumed by the parent profile easy to
+        # reproduce without importing torch or normalizing JSON.
+        self.assertEqual(
+            len(hashlib.sha256(manifest_text.encode("utf-8")).hexdigest()), 64
+        )
+
 
 class ExtensionApiContractTest(unittest.TestCase):
     def test_old_binding_and_forward_path_remain(self):
@@ -80,6 +155,92 @@ class ExtensionApiContractTest(unittest.TestCase):
         self.assertIn('capabilities["stream_aware"] = true', extension)
         self.assertIn("def tacker_capabilities():", python_api)
         self.assertIn("def forward_with_head(", python_api)
+
+    def test_v2_binding_capabilities_and_resource_query_are_exposed(self):
+        extension = source("ext.cpp")
+        python_api = source("diff_gaussian_rasterization/__init__.py")
+        header = source("rasterize_points.h")
+        for required in (
+            "rasterize_gaussians_with_heads",
+            "mixed_render_heads_abi",
+            "max_mixed_heads",
+            "supported_worker_groups",
+            "tacker_resource_requirements",
+        ):
+            self.assertIn(required, extension)
+        self.assertIn("RasterizeGaussiansWithHeadsCUDA", header)
+        self.assertIn("def forward_with_heads(", python_api)
+        self.assertIn("def tacker_variant_resources(", python_api)
+        for resource_key in (
+            "block_threads",
+            "registers_per_thread",
+            "static_shared_memory_bytes",
+            "max_threads_per_block",
+            "active_blocks_per_sm",
+        ):
+            self.assertIn(resource_key, python_api)
+
+    def test_capability_manifest_hashes_match_exact_artifact_bytes(self):
+        extension = source("ext.cpp")
+        manifest_by_capability = {
+            "mixed_manifest_sha256": "abi/tacker_mixed_render_head_v1.json",
+            "head_manifest_sha256": "../../tacker_ext/abi/head_linear_v1.json",
+            "mixed_multi_manifest_sha256": (
+                "abi/tacker_mixed_render_heads_v2.json"
+            ),
+            "head_multi_manifest_sha256": (
+                "../../tacker_ext/abi/head_linear_v2.json"
+            ),
+        }
+        for capability, manifest_path in manifest_by_capability.items():
+            with self.subTest(capability=capability):
+                self.assertEqual(
+                    capability_sha256(extension, capability),
+                    manifest_sha256(manifest_path),
+                )
+
+    def test_v2_cpp_validation_is_fail_closed(self):
+        binding = source("rasterize_points.cu")
+        for required in (
+            "head_inputs, head_weights, and head_biases must have equal lengths",
+            "mixed ABI v2 requires between 1 and 5 head tasks",
+            "worker_groups must be in [1, task_count]",
+            "must have shape [N, 128]",
+            "must have shape [128, 128]",
+            "must have shape [128]",
+            "row count exceeds the int32 mixed ABI v2",
+            "must be natively 32-byte aligned for WMMA",
+            "mixed ABI v2 head outputs must not alias each other",
+        ):
+            self.assertIn(required, binding)
+        self.assertIn("MixedHeadBundleV2 head_bundle = {}", binding)
+        self.assertIn("any_head_rows", binding)
+
+    def test_v2_resources_include_register_smem_and_occupancy(self):
+        cuda = source("cuda_rasterizer/tacker_mixed.cu")
+        header = source("cuda_rasterizer/tacker_mixed.h")
+        for required in (
+            "cudaFuncGetAttributes",
+            "attributes.numRegs",
+            "attributes.sharedSizeBytes",
+            "cudaOccupancyMaxActiveBlocksPerMultiprocessor",
+            "launch_supported",
+        ):
+            self.assertIn(required, cuda + header)
+        self.assertIn("cudaPeekAtLastError", cuda)
+        self.assertIn("(void)cudaGetLastError()", cuda)
+        self.assertNotIn("cudaDeviceSynchronize", cuda)
+
+    def test_v1_symbol_binding_and_manifest_are_preserved_with_v2(self):
+        cuda = source("cuda_rasterizer/tacker_mixed.cu")
+        extension = source("ext.cpp")
+        manifest = json.loads(source("abi/tacker_mixed_render_head_v1.json"))
+        self.assertIn("tacker_mix_render_head_v1", cuda)
+        self.assertIn('"rasterize_gaussians_with_head"', extension)
+        self.assertEqual(manifest["abi_version"], 1)
+        self.assertEqual(
+            manifest["global_kernel_symbol"], "tacker_mix_render_head_v1"
+        )
 
     def test_inference_guard_and_no_backward_registration(self):
         python_api = source("diff_gaussian_rasterization/__init__.py")
@@ -175,6 +336,7 @@ class ExtensionApiContractTest(unittest.TestCase):
         self.assertIn("Path(__file__).resolve().parent", setup)
         self.assertIn('"tacker_mixed.cu"', setup)
         self.assertIn("TACKER_4DGS_HEAD_INCLUDE", setup)
+        self.assertIn("head_linear_v2_device.cuh", setup)
         self.assertIn('os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"', setup)
         self.assertIn('"-Xptxas=-v"', setup)
 

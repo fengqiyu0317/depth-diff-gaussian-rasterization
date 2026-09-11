@@ -30,6 +30,46 @@ def tacker_capabilities():
         }
     return dict(_C.tacker_capabilities())
 
+
+def tacker_resource_requirements(abi_version=2, worker_groups=1):
+    """Query launch resources/occupancy for one compiled mixed variant."""
+
+    for name, value in (
+        ("abi_version", abi_version),
+        ("worker_groups", worker_groups),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an int")
+    if not hasattr(_C, "tacker_resource_requirements"):
+        raise RuntimeError(
+            "installed diff_gaussian_rasterization extension does not "
+            "provide the Tacker resource query; rebuild the extension"
+        )
+    return dict(
+        _C.tacker_resource_requirements(abi_version, worker_groups)
+    )
+
+
+def tacker_variant_resources(worker_groups):
+    """Return the schema-v2 runtime's normalized resource vocabulary."""
+
+    raw = tacker_resource_requirements(
+        abi_version=2, worker_groups=worker_groups
+    )
+    normalized = dict(raw)
+    normalized.update(
+        {
+            "block_threads": raw["physical_threads"],
+            "registers_per_thread": raw["registers_per_thread"],
+            "static_shared_memory_bytes": raw["static_shared_bytes"],
+            "max_threads_per_block": raw["kernel_max_threads_per_block"],
+            "active_blocks_per_sm": raw[
+                "active_blocks_per_multiprocessor"
+            ],
+        }
+    )
+    return normalized
+
 def rasterize_gaussians(
     means3D,
     means2D,
@@ -342,3 +382,127 @@ class GaussianRasterizer(nn.Module):
             head_output,
         ) = _C.rasterize_gaussians_with_head(*args)
         return color, radii, depth, head_output
+
+    def forward_with_heads(
+        self,
+        means3D,
+        means2D,
+        opacities,
+        head_inputs,
+        head_weights,
+        head_biases,
+        worker_groups=1,
+        persistent_blocks=0,
+        shs=None,
+        colors_precomp=None,
+        scales=None,
+        rotations=None,
+        cov3D_precomp=None,
+    ):
+        """Fuse Raster with 1--5 first-linear deformation-head tasks.
+
+        Each task computes ``input @ weight.T + bias`` and returns a distinct
+        FP32 ``[N, 128]`` tensor.  Read-only operands may alias across tasks,
+        which permits all five heads to share one hidden activation.  Worker
+        group ``g`` evaluates task indices ``g, g + worker_groups, ...``.
+        """
+
+        if torch.is_grad_enabled():
+            raise RuntimeError(
+                "GaussianRasterizer.forward_with_heads is inference-only; "
+                "call it under torch.no_grad()"
+            )
+        if not hasattr(_C, "rasterize_gaussians_with_heads"):
+            raise RuntimeError(
+                "installed diff_gaussian_rasterization extension does not "
+                "provide the Tacker mixed ABI v2; rebuild the extension"
+            )
+        for name, values in (
+            ("head_inputs", head_inputs),
+            ("head_weights", head_weights),
+            ("head_biases", head_biases),
+        ):
+            if not isinstance(values, (list, tuple)):
+                raise TypeError(f"{name} must be a list or tuple of tensors")
+        head_inputs = tuple(head_inputs)
+        head_weights = tuple(head_weights)
+        head_biases = tuple(head_biases)
+        if not isinstance(worker_groups, int) or isinstance(worker_groups, bool):
+            raise TypeError("worker_groups must be an int")
+        if not isinstance(persistent_blocks, int) or isinstance(
+            persistent_blocks, bool
+        ):
+            raise TypeError("persistent_blocks must be an int")
+        if worker_groups < 1:
+            raise ValueError("worker_groups must be >= 1")
+        if persistent_blocks < 0:
+            raise ValueError("persistent_blocks must be >= 0")
+
+        if (shs is None and colors_precomp is None) or (
+            shs is not None and colors_precomp is not None
+        ):
+            raise Exception(
+                "Please provide exactly one of either SHs or precomputed colors!"
+            )
+        if (
+            (scales is None or rotations is None) and cov3D_precomp is None
+        ) or (
+            (scales is not None or rotations is not None)
+            and cov3D_precomp is not None
+        ):
+            raise Exception(
+                "Please provide exactly one of either scale/rotation pair or "
+                "precomputed 3D covariance!"
+            )
+
+        empty = means3D.new_empty((0,))
+        if shs is None:
+            shs = empty
+        if colors_precomp is None:
+            colors_precomp = empty
+        if scales is None:
+            scales = empty
+        if rotations is None:
+            rotations = empty
+        if cov3D_precomp is None:
+            cov3D_precomp = empty
+
+        raster_settings = self.raster_settings
+        args = (
+            raster_settings.bg,
+            means3D,
+            colors_precomp,
+            opacities,
+            scales,
+            rotations,
+            raster_settings.scale_modifier,
+            cov3D_precomp,
+            raster_settings.viewmatrix,
+            raster_settings.projmatrix,
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            raster_settings.image_height,
+            raster_settings.image_width,
+            shs,
+            raster_settings.sh_degree,
+            raster_settings.campos,
+            raster_settings.prefiltered,
+            raster_settings.debug,
+            head_inputs,
+            head_weights,
+            head_biases,
+            worker_groups,
+            persistent_blocks,
+        )
+
+        (
+            _num_rendered,
+            color,
+            depth,
+            radii,
+            _geom_buffer,
+            _binning_buffer,
+            _image_buffer,
+            head_outputs,
+        ) = _C.rasterize_gaussians_with_heads(*args)
+        return color, radii, depth, tuple(head_outputs)

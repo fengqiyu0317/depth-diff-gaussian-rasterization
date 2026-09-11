@@ -29,6 +29,26 @@ select SH versus precomputed colors and covariance versus scale/rotation. Thus
 real zero-row tensors such as `[0, M, 3]` remain distinguishable from omitted
 `[0]` placeholders.
 
+Mixed ABI v2 adds
+`GaussianRasterizer.forward_with_heads(..., head_inputs, head_weights,
+head_biases, worker_groups, persistent_blocks)`. It accepts 1--5 independent
+first-linear tasks and returns `(color, radii, depth, head_outputs)`, preserving
+task order. The physical CTA has `256 + worker_groups * 128` threads (384,
+512, 640, 768, or 896). Worker group `g` owns tasks `g, g+worker_groups, ...`,
+so a two-head C2 candidate may use either one serialized backend group or two
+parallel groups. Read-only inputs may alias across heads; outputs are distinct.
+Zero rows and non-multiples of 16 are valid, while shape, dtype, device,
+contiguity, 32-byte WMMA alignment, int32 overflow, worker-group, occupancy,
+and launch errors fail closed.
+
+`tacker_capabilities()` enumerates v1 and v2 without touching the device.
+`tacker_variant_resources(worker_groups)` queries the active device and reports
+the CTA thread count, ptxas register/static-shared/local-memory attributes, and
+CUDA occupancy used by runtime admission. The raw query is
+`tacker_resource_requirements(abi_version=2, worker_groups=1)`. The exact v2
+contract is in `abi/tacker_mixed_render_heads_v2.json`; v1 remains callable and
+byte-independent.
+
 The legacy forward, visibility, and autograd backward paths enqueue every CUDA
 kernel on PyTorch's current stream. The small rendered-count host readback is a
 stream-local synchronization required to size the binning buffers; it is never
@@ -46,6 +66,12 @@ alignment and zero-row ranked alternatives) can be run with:
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python -m unittest tests.test_tacker_mixed_cuda -v
 ```
+
+The CUDA suite covers 1--5 heads, every legal worker-group count, a dual-head
+C2 variant, zero/tail rows, shared-input aliasing, fail-closed argument errors,
+and per-variant runtime resource queries. Numerical head tolerance is
+`atol=rtol=2e-3`; full Raster color/depth/radii equivalence still requires the
+configured A6000 qualification run.
 
 The legacy training API has a separate GPU smoke test that renders one real
 Gaussian and runs autograd forward/backward on a non-default PyTorch stream:
