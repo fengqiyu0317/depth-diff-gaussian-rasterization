@@ -39,6 +39,25 @@ static_assert(
 	CudaRasterizer::Tacker::kRasterBarrierId !=
 		CudaRasterizer::Tacker::kHeadDescriptorBarrierIdV2,
 	"Raster and v2 head descriptor barriers must be disjoint");
+static_assert(
+	CudaRasterizer::Tacker::kRasterBarrierId <
+		CudaRasterizer::Tacker::kWholeHeadBarrierBaseIdV2 ||
+	CudaRasterizer::Tacker::kRasterBarrierId >=
+		CudaRasterizer::Tacker::kWholeHeadBarrierBaseIdV2 +
+			CudaRasterizer::Tacker::kMaxWorkerGroupsV2,
+	"Raster and whole-head worker barriers must be disjoint");
+static_assert(
+	CudaRasterizer::Tacker::kWholeHeadDescriptorBarrierIdV2 !=
+		CudaRasterizer::Tacker::kRasterBarrierId &&
+	CudaRasterizer::Tacker::kWholeHeadDescriptorBarrierIdV2 >=
+		CudaRasterizer::Tacker::kWholeHeadBarrierBaseIdV2 +
+			CudaRasterizer::Tacker::kMaxWorkerGroupsV2 &&
+	CudaRasterizer::Tacker::kWholeHeadDescriptorBarrierIdV2 < 16,
+	"whole-head descriptor barrier must be disjoint and architecturally valid");
+static_assert(
+	CudaRasterizer::Tacker::kMaxTailFeaturesV2 ==
+		tacker_4dgs::kMaxTailFeaturesV2,
+	"Raster and tacker_ext whole-head tail limits must agree");
 
 // Keep the core Rasterizer independent of CUDA half headers while proving
 // that its opaque host descriptor may be copied into the tacker_ext device
@@ -65,6 +84,32 @@ TACKER_ASSERT_TASK_OFFSET(bias);
 TACKER_ASSERT_TASK_OFFSET(output);
 TACKER_ASSERT_TASK_OFFSET(rows);
 #undef TACKER_ASSERT_TASK_OFFSET
+
+static_assert(
+	std::is_standard_layout<CudaRasterizer::MixedWholeHeadTaskV2>::value &&
+		std::is_standard_layout<tacker_4dgs::WholeHeadTaskV2>::value,
+	"mixed whole-head task descriptors must be standard-layout PODs");
+static_assert(
+	sizeof(CudaRasterizer::MixedWholeHeadTaskV2) ==
+		sizeof(tacker_4dgs::WholeHeadTaskV2),
+	"mixed whole-head task descriptor size mismatch");
+static_assert(
+	alignof(CudaRasterizer::MixedWholeHeadTaskV2) ==
+		alignof(tacker_4dgs::WholeHeadTaskV2),
+	"mixed whole-head task descriptor alignment mismatch");
+#define TACKER_ASSERT_WHOLE_TASK_OFFSET(field) \
+	static_assert(offsetof(CudaRasterizer::MixedWholeHeadTaskV2, field) == \
+		offsetof(tacker_4dgs::WholeHeadTaskV2, field), \
+		"mixed whole-head descriptor field offset mismatch: " #field)
+TACKER_ASSERT_WHOLE_TASK_OFFSET(input);
+TACKER_ASSERT_WHOLE_TASK_OFFSET(first_weight);
+TACKER_ASSERT_WHOLE_TASK_OFFSET(first_bias);
+TACKER_ASSERT_WHOLE_TASK_OFFSET(tail_weight);
+TACKER_ASSERT_WHOLE_TASK_OFFSET(tail_bias);
+TACKER_ASSERT_WHOLE_TASK_OFFSET(output);
+TACKER_ASSERT_WHOLE_TASK_OFFSET(rows);
+TACKER_ASSERT_WHOLE_TASK_OFFSET(tail_features);
+#undef TACKER_ASSERT_WHOLE_TASK_OFFSET
 
 extern "C" __global__ void __launch_bounds__(CudaRasterizer::Tacker::kMixedThreads)
 tacker_mix_render_head_v1(
@@ -222,6 +267,162 @@ tacker_mix_render_heads_v2(
 	}
 }
 
+extern "C" __global__ void __launch_bounds__(CudaRasterizer::Tacker::kMaxMixedThreadsV2)
+tacker_mix_render_packed_heads_v3(
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int width,
+	int height,
+	const float2* points_xy_image,
+	const float* features,
+	const float* depths,
+	const float4* conic_opacity,
+	float* final_T,
+	uint32_t* n_contrib,
+	const float* background,
+	float* out_color,
+	float* out_depth,
+	int raster_grid_x,
+	int raster_grid_y,
+	const half* head_input,
+	const half* packed_weights,
+	const float* packed_biases,
+	float* packed_outputs,
+	int head_rows,
+	int head_count,
+	int worker_groups,
+	int max_head_logical_blocks,
+	int physical_blocks)
+{
+	CudaRasterizer::Tacker::general_ptb_render<NUM_CHANNELS>(
+		ranges,
+		point_list,
+		width,
+		height,
+		points_xy_image,
+		features,
+		depths,
+		conic_opacity,
+		final_T,
+		n_contrib,
+		background,
+		out_color,
+		out_depth,
+		raster_grid_x,
+		raster_grid_y,
+		0,
+		physical_blocks,
+		raster_grid_x * raster_grid_y,
+		0,
+		CudaRasterizer::Tacker::kRasterBarrierId);
+
+	// C3 needs no named or CTA-wide backend barrier.  The adapter rejects the
+	// Raster lanes by thread_base and schedules every packed head exactly once.
+	tacker_4dgs::head_linear_packed_gptb_device(
+		head_input,
+		packed_weights,
+		packed_biases,
+		packed_outputs,
+		head_rows,
+		head_count,
+		worker_groups,
+		0,
+		physical_blocks,
+		max_head_logical_blocks,
+		CudaRasterizer::Tacker::kHeadThreadBase);
+}
+
+extern "C" __global__ void __launch_bounds__(CudaRasterizer::Tacker::kMaxMixedThreadsV2)
+tacker_mix_render_whole_heads_v4(
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int width,
+	int height,
+	const float2* points_xy_image,
+	const float* features,
+	const float* depths,
+	const float4* conic_opacity,
+	float* final_T,
+	uint32_t* n_contrib,
+	const float* background,
+	float* out_color,
+	float* out_depth,
+	int raster_grid_x,
+	int raster_grid_y,
+	CudaRasterizer::MixedWholeHeadTaskV2 head_task_0,
+	CudaRasterizer::MixedWholeHeadTaskV2 head_task_1,
+	CudaRasterizer::MixedWholeHeadTaskV2 head_task_2,
+	CudaRasterizer::MixedWholeHeadTaskV2 head_task_3,
+	CudaRasterizer::MixedWholeHeadTaskV2 head_task_4,
+	int head_task_count,
+	int worker_groups,
+	int max_head_rows,
+	int physical_blocks)
+{
+	CudaRasterizer::Tacker::general_ptb_render<NUM_CHANNELS>(
+		ranges,
+		point_list,
+		width,
+		height,
+		points_xy_image,
+		features,
+		depths,
+		conic_opacity,
+		final_T,
+		n_contrib,
+		background,
+		out_color,
+		out_depth,
+		raster_grid_x,
+		raster_grid_y,
+		0,
+		physical_blocks,
+		raster_grid_x * raster_grid_y,
+		0,
+		CudaRasterizer::Tacker::kRasterBarrierId);
+
+	__shared__ CudaRasterizer::MixedWholeHeadTaskV2 shared_head_tasks[
+		CudaRasterizer::Tacker::kMaxHeadTasksV2];
+	__shared__ float shared_hidden[
+		CudaRasterizer::Tacker::kMaxWorkerGroupsV2 *
+		tacker_4dgs::kWholeHeadScratchFloatsPerGroupV2];
+	const int backend_thread = static_cast<int>(threadIdx.x) -
+		CudaRasterizer::Tacker::kHeadThreadBase;
+	const int backend_threads =
+		worker_groups * CudaRasterizer::Tacker::kWorkerGroupThreadsV2;
+	if (backend_thread >= 0 && backend_thread < backend_threads)
+	{
+		if (backend_thread < head_task_count)
+		{
+			switch (backend_thread)
+			{
+			case 0: shared_head_tasks[0] = head_task_0; break;
+			case 1: shared_head_tasks[1] = head_task_1; break;
+			case 2: shared_head_tasks[2] = head_task_2; break;
+			case 3: shared_head_tasks[3] = head_task_3; break;
+			case 4: shared_head_tasks[4] = head_task_4; break;
+			}
+		}
+		// Barrier 7 has exactly all backend lanes.  Whole-head worker groups then
+		// use barriers 2..6 with exactly 128 participants apiece; Raster owns 1.
+		CudaRasterizer::Tacker::subgroup_sync(
+			CudaRasterizer::Tacker::kWholeHeadDescriptorBarrierIdV2,
+			backend_threads);
+
+		tacker_4dgs::whole_head_multi_gptb_device(
+			reinterpret_cast<const tacker_4dgs::WholeHeadTaskV2*>(
+				shared_head_tasks),
+			head_task_count,
+			worker_groups,
+			0,
+			physical_blocks,
+			max_head_rows,
+			CudaRasterizer::Tacker::kHeadThreadBase,
+			shared_hidden,
+			CudaRasterizer::Tacker::kWholeHeadBarrierBaseIdV2);
+	}
+}
+
 namespace
 {
 
@@ -312,8 +513,73 @@ void validateMixedHeadBundleV2(const CudaRasterizer::MixedHeadBundleV2& heads)
 	}
 }
 
+void validateMixedPackedHeadBundleV2(
+	const CudaRasterizer::MixedPackedHeadBundleV2& heads)
+{
+	if (heads.head_count < 1 ||
+		heads.head_count > CudaRasterizer::Tacker::kMaxHeadTasksV2)
+		throw std::invalid_argument("mixed packed head_count must be in [1, 5]");
+	if (heads.worker_groups < CudaRasterizer::Tacker::kMinWorkerGroupsV2 ||
+		heads.worker_groups > heads.head_count)
+		throw std::invalid_argument(
+			"mixed packed worker_groups must be in [1, head_count]");
+	if (heads.persistent_blocks < 0)
+		throw std::invalid_argument("persistent_blocks must be >= 0");
+	if (heads.rows < 0)
+		throw std::invalid_argument("mixed packed rows must be >= 0");
+	if (heads.rows > 0 &&
+		(heads.input == nullptr || heads.weights == nullptr ||
+		 heads.biases == nullptr || heads.output == nullptr))
+		throw std::invalid_argument(
+			"mixed packed pointers must be non-null when rows > 0");
+}
+
+void validateMixedWholeHeadBundleV2(
+	const CudaRasterizer::MixedWholeHeadBundleV2& heads)
+{
+	if (heads.task_count < 1 ||
+		heads.task_count > CudaRasterizer::Tacker::kMaxHeadTasksV2)
+		throw std::invalid_argument(
+			"mixed whole-head task_count must be in [1, 5]");
+	if (heads.worker_groups < CudaRasterizer::Tacker::kMinWorkerGroupsV2 ||
+		heads.worker_groups > heads.task_count)
+		throw std::invalid_argument(
+			"mixed whole-head worker_groups must be in [1, task_count]");
+	if (heads.persistent_blocks < 0)
+		throw std::invalid_argument("persistent_blocks must be >= 0");
+
+	for (int task_index = 0; task_index < heads.task_count; ++task_index)
+	{
+		const CudaRasterizer::MixedWholeHeadTaskV2& task =
+			heads.tasks[task_index];
+		if (task.rows < 0)
+			throw std::invalid_argument(
+				"mixed whole-head rows must be >= 0");
+		if (task.tail_features < 1 ||
+			task.tail_features > CudaRasterizer::Tacker::kMaxTailFeaturesV2)
+			throw std::invalid_argument(
+				"mixed whole-head tail_features must be in [1, 128]");
+		if (task.rows > 0 &&
+			(task.input == nullptr || task.first_weight == nullptr ||
+			 task.first_bias == nullptr || task.tail_weight == nullptr ||
+			 task.tail_bias == nullptr || task.output == nullptr))
+			throw std::invalid_argument(
+				"mixed whole-head pointers must be non-null when rows > 0");
+		if (task.rows == 0)
+			continue;
+		for (int other = 0; other < task_index; ++other)
+		{
+			if (heads.tasks[other].rows > 0 &&
+				heads.tasks[other].output == task.output)
+				throw std::invalid_argument(
+					"mixed whole-head outputs must not alias each other");
+		}
+	}
+}
+
 CudaRasterizer::Tacker::MixedKernelResources queryKernelResources(
 	int abi_version,
+	CudaRasterizer::Tacker::MixedBackendFamily family,
 	int worker_groups,
 	int physical_threads,
 	const void* kernel)
@@ -327,6 +593,7 @@ CudaRasterizer::Tacker::MixedKernelResources queryKernelResources(
 
 	CudaRasterizer::Tacker::MixedKernelResources result = {};
 	result.abi_version = abi_version;
+	result.backend_family = family;
 	result.worker_groups = worker_groups;
 	result.physical_threads = physical_threads;
 	result.device_ordinal = device;
@@ -375,7 +642,11 @@ CudaRasterizer::Tacker::MixedKernelResources queryKernelResources(
 	return result;
 }
 
-void ensureV2LaunchSupported(int worker_groups)
+void ensureLaunchSupported(
+	int abi_version,
+	CudaRasterizer::Tacker::MixedBackendFamily family,
+	int worker_groups,
+	const void* kernel)
 {
 	int device = 0;
 	activeDeviceProperties(&device);
@@ -388,24 +659,27 @@ void ensureV2LaunchSupported(int worker_groups)
 		checked_mask = 0;
 		supported_mask = 0;
 	}
-	const unsigned int bit = 1u << worker_groups;
+	const unsigned int family_index =
+		static_cast<unsigned int>(family);
+	const unsigned int bit = 1u << (family_index * 8u + worker_groups);
 	if ((checked_mask & bit) == 0)
 	{
 		const CudaRasterizer::Tacker::MixedKernelResources resources =
 			queryKernelResources(
-				CudaRasterizer::Tacker::kMixedMultiAbiVersion,
+				abi_version,
+				family,
 				worker_groups,
 				CudaRasterizer::Tacker::kRasterThreads +
 					worker_groups *
 						CudaRasterizer::Tacker::kWorkerGroupThreadsV2,
-				reinterpret_cast<const void*>(tacker_mix_render_heads_v2));
+				kernel);
 		checked_mask |= bit;
 		if (resources.launch_supported)
 			supported_mask |= bit;
 	}
 	if ((supported_mask & bit) == 0)
 		throw std::runtime_error(
-			"mixed ABI v2 kernel has zero active blocks or exceeds the active "
+			"mixed backend kernel has zero active blocks or exceeds the active "
 			"device/kernel thread limit");
 }
 
@@ -527,7 +801,11 @@ void CudaRasterizer::Tacker::launchMixedRenderHeads(
 		static_cast<int>(raster_blocks_64), max_head_logical_blocks);
 	if (logical_blocks == 0)
 		return;
-	ensureV2LaunchSupported(heads.worker_groups);
+	ensureLaunchSupported(
+		kMixedMultiAbiVersion,
+		MixedBackendFamily::FirstLinear,
+		heads.worker_groups,
+		reinterpret_cast<const void*>(tacker_mix_render_heads_v2));
 
 	int physical_blocks = heads.persistent_blocks;
 	if (physical_blocks == 0)
@@ -570,33 +848,242 @@ void CudaRasterizer::Tacker::launchMixedRenderHeads(
 	throwOnLaunchError();
 }
 
+void CudaRasterizer::Tacker::launchMixedRenderPackedHeads(
+	const dim3 raster_grid,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int width,
+	int height,
+	const float2* points_xy_image,
+	const float* features,
+	const float* depths,
+	const float4* conic_opacity,
+	float* final_T,
+	uint32_t* n_contrib,
+	const float* background,
+	float* out_color,
+	float* out_depth,
+	const MixedPackedHeadBundleV2& heads,
+	cudaStream_t stream)
+{
+	validateMixedPackedHeadBundleV2(heads);
+	const int64_t raster_blocks_64 =
+		static_cast<int64_t>(raster_grid.x) * static_cast<int64_t>(raster_grid.y);
+	if (raster_blocks_64 > INT_MAX)
+		throw std::overflow_error(
+			"raster logical grid exceeds int32 mixed packed ABI v3");
+	const int max_head_logical_blocks = headLogicalBlocks(heads.rows);
+	const int logical_blocks = std::max(
+		static_cast<int>(raster_blocks_64), max_head_logical_blocks);
+	if (logical_blocks == 0)
+		return;
+	ensureLaunchSupported(
+		kMixedPackedAbiVersion,
+		MixedBackendFamily::PackedFirstLinear,
+		heads.worker_groups,
+		reinterpret_cast<const void*>(tacker_mix_render_packed_heads_v3));
+
+	int physical_blocks = heads.persistent_blocks;
+	if (physical_blocks == 0)
+		physical_blocks = activeSmCount();
+	physical_blocks = std::max(1, std::min(physical_blocks, logical_blocks));
+	const int physical_threads = kRasterThreads +
+		heads.worker_groups * kWorkerGroupThreadsV2;
+
+	tacker_mix_render_packed_heads_v3<<<
+		physical_blocks, physical_threads, 0, stream>>>(
+		ranges,
+		point_list,
+		width,
+		height,
+		points_xy_image,
+		features,
+		depths,
+		conic_opacity,
+		final_T,
+		n_contrib,
+		background,
+		out_color,
+		out_depth,
+		static_cast<int>(raster_grid.x),
+		static_cast<int>(raster_grid.y),
+		reinterpret_cast<const half*>(heads.input),
+		reinterpret_cast<const half*>(heads.weights),
+		heads.biases,
+		heads.output,
+		heads.rows,
+		heads.head_count,
+		heads.worker_groups,
+		max_head_logical_blocks,
+		physical_blocks);
+	throwOnLaunchError();
+}
+
+void CudaRasterizer::Tacker::launchMixedRenderWholeHeads(
+	const dim3 raster_grid,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int width,
+	int height,
+	const float2* points_xy_image,
+	const float* features,
+	const float* depths,
+	const float4* conic_opacity,
+	float* final_T,
+	uint32_t* n_contrib,
+	const float* background,
+	float* out_color,
+	float* out_depth,
+	const MixedWholeHeadBundleV2& heads,
+	cudaStream_t stream)
+{
+	validateMixedWholeHeadBundleV2(heads);
+	const int64_t raster_blocks_64 =
+		static_cast<int64_t>(raster_grid.x) * static_cast<int64_t>(raster_grid.y);
+	if (raster_blocks_64 > INT_MAX)
+		throw std::overflow_error(
+			"raster logical grid exceeds int32 mixed whole-head ABI v4");
+	int max_head_rows = 0;
+	for (int task_index = 0; task_index < heads.task_count; ++task_index)
+		max_head_rows = std::max(max_head_rows, heads.tasks[task_index].rows);
+	const int logical_blocks = std::max(
+		static_cast<int>(raster_blocks_64), max_head_rows);
+	if (logical_blocks == 0)
+		return;
+	ensureLaunchSupported(
+		kMixedWholeHeadAbiVersion,
+		MixedBackendFamily::WholeHead,
+		heads.worker_groups,
+		reinterpret_cast<const void*>(tacker_mix_render_whole_heads_v4));
+
+	int physical_blocks = heads.persistent_blocks;
+	if (physical_blocks == 0)
+		physical_blocks = activeSmCount();
+	physical_blocks = std::max(1, std::min(physical_blocks, logical_blocks));
+	const int physical_threads = kRasterThreads +
+		heads.worker_groups * kWorkerGroupThreadsV2;
+
+	tacker_mix_render_whole_heads_v4<<<
+		physical_blocks, physical_threads, 0, stream>>>(
+		ranges,
+		point_list,
+		width,
+		height,
+		points_xy_image,
+		features,
+		depths,
+		conic_opacity,
+		final_T,
+		n_contrib,
+		background,
+		out_color,
+		out_depth,
+		static_cast<int>(raster_grid.x),
+		static_cast<int>(raster_grid.y),
+		heads.tasks[0],
+		heads.tasks[1],
+		heads.tasks[2],
+		heads.tasks[3],
+		heads.tasks[4],
+		heads.task_count,
+		heads.worker_groups,
+		max_head_rows,
+		physical_blocks);
+	throwOnLaunchError();
+}
+
+const char* CudaRasterizer::Tacker::mixedBackendFamilyName(
+	MixedBackendFamily family)
+{
+	switch (family)
+	{
+	case MixedBackendFamily::FirstLinear:
+		return "first_linear_heads_v2";
+	case MixedBackendFamily::PackedFirstLinear:
+		return "packed_first_linear_v3";
+	case MixedBackendFamily::WholeHead:
+		return "whole_heads_v4";
+	}
+	throw std::invalid_argument("unsupported mixed backend family");
+}
+
 CudaRasterizer::Tacker::MixedKernelResources
 CudaRasterizer::Tacker::queryMixedKernelResources(
 	int abi_version,
 	int worker_groups)
 {
+	return queryMixedKernelResources(
+		abi_version, worker_groups, MixedBackendFamily::FirstLinear);
+}
+
+CudaRasterizer::Tacker::MixedKernelResources
+CudaRasterizer::Tacker::queryMixedKernelResources(
+	int abi_version,
+	int worker_groups,
+	MixedBackendFamily family)
+{
 	if (abi_version == kMixedAbiVersion)
 	{
+		if (family != MixedBackendFamily::FirstLinear)
+			throw std::invalid_argument(
+				"mixed ABI v1 only supports the first-linear family");
 		if (worker_groups != 1)
 			throw std::invalid_argument(
 				"mixed ABI v1 requires worker_groups == 1");
 		return queryKernelResources(
 			abi_version,
+			family,
 			worker_groups,
 			kMixedThreads,
 			reinterpret_cast<const void*>(tacker_mix_render_head_v1));
 	}
 	if (abi_version == kMixedMultiAbiVersion)
 	{
+		if (family != MixedBackendFamily::FirstLinear)
+			throw std::invalid_argument(
+				"mixed ABI v2 requires family first_linear_heads_v2");
 		if (worker_groups < kMinWorkerGroupsV2 ||
 			worker_groups > kMaxWorkerGroupsV2)
 			throw std::invalid_argument(
 				"mixed ABI v2 worker_groups must be in [1, 5]");
 		return queryKernelResources(
 			abi_version,
+			family,
 			worker_groups,
 			kRasterThreads + worker_groups * kWorkerGroupThreadsV2,
 			reinterpret_cast<const void*>(tacker_mix_render_heads_v2));
+	}
+	if (abi_version == kMixedPackedAbiVersion)
+	{
+		if (family != MixedBackendFamily::PackedFirstLinear)
+			throw std::invalid_argument(
+				"mixed ABI v3 requires family packed_first_linear_v3");
+		if (worker_groups < kMinWorkerGroupsV2 ||
+			worker_groups > kMaxWorkerGroupsV2)
+			throw std::invalid_argument(
+				"mixed ABI v3 worker_groups must be in [1, 5]");
+		return queryKernelResources(
+			abi_version,
+			family,
+			worker_groups,
+			kRasterThreads + worker_groups * kWorkerGroupThreadsV2,
+			reinterpret_cast<const void*>(tacker_mix_render_packed_heads_v3));
+	}
+	if (abi_version == kMixedWholeHeadAbiVersion)
+	{
+		if (family != MixedBackendFamily::WholeHead)
+			throw std::invalid_argument(
+				"mixed ABI v4 requires family whole_heads_v4");
+		if (worker_groups < kMinWorkerGroupsV2 ||
+			worker_groups > kMaxWorkerGroupsV2)
+			throw std::invalid_argument(
+				"mixed ABI v4 worker_groups must be in [1, 5]");
+		return queryKernelResources(
+			abi_version,
+			family,
+			worker_groups,
+			kRasterThreads + worker_groups * kWorkerGroupThreadsV2,
+			reinterpret_cast<const void*>(tacker_mix_render_whole_heads_v4));
 	}
 	throw std::invalid_argument("unsupported mixed ABI version");
 }

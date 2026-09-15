@@ -49,6 +49,48 @@ CUDA occupancy used by runtime admission. The raw query is
 contract is in `abi/tacker_mixed_render_heads_v2.json`; v1 remains callable and
 byte-independent.
 
+Mixed ABI v3 is the production C3 packed backend.  Call
+`GaussianRasterizer.forward_with_packed_heads(...)` with one shared contiguous
+FP16 `head_input [N,128]`, contiguous FP16
+`packed_head_weights [H,128,128]`, and contiguous FP32
+`packed_head_biases [H,128]`.  It returns one FP32 `[H,N,128]` tensor in the
+selected-head order.  `H` is 1--5, `worker_groups` is in `[1,H]`, and every
+packed head is evaluated exactly once by
+`tacker_mix_render_packed_heads_v3`.  The backend adapter uses no named or
+CTA-wide barrier; Raster retains barrier 1 with exactly 256 participants.  The
+machine-readable contract is
+`abi/tacker_mixed_render_packed_heads_v3.json`.
+
+Mixed ABI v4 is the production C4 complete-head backend.  The plural method
+`GaussianRasterizer.forward_with_whole_heads(...)` accepts 1--5 task-ordered
+input/first-weight/first-bias/tail-weight/tail-bias sequences and a matching
+`output_widths` sequence.  Each output computes
+`Linear_fp32(ReLU(Linear_fp16(input)))` and has shape `[N_i,O_i]`, where
+`1 <= O_i <= 128`; the 4DGaussians widths are 1, 3, 4, and 48.  The singular
+`forward_with_whole_head(...)` method uses the same physical
+`tacker_mix_render_whole_heads_v4` kernel with one worker group.  Raster uses
+barrier 1/256 participants, whole-head groups use disjoint barriers 2--6/128
+participants, and descriptor broadcast uses barrier 7 with exactly
+`worker_groups*128` participants.  Static hidden scratch is 512 bytes per
+worker group.  See `abi/tacker_mixed_render_whole_heads_v4.json`.
+
+All C3/C4 operands and outputs require same-device CUDA storage, exact dtypes
+and shapes, contiguity, and native 32-byte pointer alignment.  Output/input,
+output/parameter, and output/output overlap is rejected before launch.  Empty
+row sets and row tails are safe; invalid tail widths, `persistent_blocks`,
+resource configurations, and launch errors fail closed.  An empty Raster does
+not suppress non-empty C3/C4 work, while an entirely empty call launches no
+kernel.
+
+The family-aware resource APIs are
+`tacker_resource_requirements(abi_version, worker_groups, family)` and
+`tacker_variant_resources(worker_groups, family=...)`.  Families are
+`first_linear_heads_v2`, `packed_first_linear_v3`, and `whole_heads_v4`.
+Reports include both `backend_abi_version` and `backend_family`, preventing a
+candidate from reusing resource evidence captured from another physical
+kernel family.  The old two-argument query remains equivalent to the v1/v2
+first-linear query.
+
 The legacy forward, visibility, and autograd backward paths enqueue every CUDA
 kernel on PyTorch's current stream. The small rendered-count host readback is a
 stream-local synchronization required to size the binning buffers; it is never
@@ -68,8 +110,10 @@ PYTHONDONTWRITEBYTECODE=1 python -m unittest tests.test_tacker_mixed_cuda -v
 ```
 
 The CUDA suite covers 1--5 heads, every legal worker-group count, a dual-head
-C2 variant, zero/tail rows, shared-input aliasing, fail-closed argument errors,
-and per-variant runtime resource queries. Numerical head tolerance is
+C2 variant, C3 packed and C4 single/multi complete-head configurations,
+zero/tail rows, shared-input aliasing, variable output widths, fail-closed
+argument errors, non-default streams, and per-family runtime resource queries.
+Numerical head tolerance is
 `atol=rtol=2e-3`; full Raster color/depth/radii equivalence still requires the
 configured A6000 qualification run.
 

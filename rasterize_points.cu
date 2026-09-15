@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <cuda_runtime_api.h>
 #include <memory>
+#include <limits>
 #include <vector>
 #include "cuda_rasterizer/config.h"
 #include "cuda_rasterizer/rasterizer.h"
@@ -52,6 +53,29 @@ bool isPlaceholder(const torch::Tensor& tensor)
 bool isNativeWmmaAligned(const torch::Tensor& tensor)
 {
 	return reinterpret_cast<uintptr_t>(tensor.data_ptr()) % kWmmaAlignment == 0;
+}
+
+bool tensorByteRangesOverlap(
+	const torch::Tensor& left,
+	const torch::Tensor& right)
+{
+	if (left.numel() == 0 || right.numel() == 0)
+		return false;
+	const uintptr_t left_begin =
+		reinterpret_cast<uintptr_t>(left.data_ptr());
+	const uintptr_t right_begin =
+		reinterpret_cast<uintptr_t>(right.data_ptr());
+	const std::size_t left_bytes = static_cast<std::size_t>(left.numel()) *
+		static_cast<std::size_t>(left.element_size());
+	const std::size_t right_bytes = static_cast<std::size_t>(right.numel()) *
+		static_cast<std::size_t>(right.element_size());
+	TORCH_CHECK(
+		left_begin <= std::numeric_limits<uintptr_t>::max() - left_bytes &&
+			right_begin <= std::numeric_limits<uintptr_t>::max() - right_bytes,
+		"tensor byte range overflows uintptr_t");
+	const uintptr_t left_end = left_begin + left_bytes;
+	const uintptr_t right_end = right_begin + right_bytes;
+	return left_begin < right_end && right_begin < left_end;
 }
 
 void checkInt32RowCount(const char* name, const torch::Tensor& tensor)
@@ -335,6 +359,322 @@ void checkMixedHeadsArguments(
 			"] data pointer must be natively 32-byte aligned for WMMA; "
 			"misaligned contiguous views are not supported");
 	}
+}
+
+void checkMixedPackedHeadsArguments(
+	const torch::Tensor& means3D,
+	const torch::Tensor& input,
+	const torch::Tensor& weights,
+	const torch::Tensor& biases,
+	int64_t worker_groups,
+	int64_t persistent_blocks)
+{
+	TORCH_CHECK(
+		!at::GradMode::is_enabled(),
+		"rasterize_gaussians_with_packed_heads is inference-only; "
+		"call it under torch.no_grad()");
+	TORCH_CHECK(weights.dim() == 3,
+		"packed head_weights must have shape [H, 128, 128]");
+	const int64_t head_count = weights.size(0);
+	TORCH_CHECK(
+		head_count >= 1 &&
+			head_count <= CudaRasterizer::Tacker::kMaxHeadTasksV2,
+		"packed head count must be in [1, 5]");
+	TORCH_CHECK(
+		worker_groups >= CudaRasterizer::Tacker::kMinWorkerGroupsV2 &&
+			worker_groups <= head_count,
+		"packed worker_groups must be in [1, head_count]");
+	TORCH_CHECK(persistent_blocks >= 0, "persistent_blocks must be >= 0");
+	TORCH_CHECK(
+		persistent_blocks <= static_cast<int64_t>(INT_MAX),
+		"persistent_blocks exceeds the int32 mixed packed ABI v3");
+	TORCH_CHECK(
+		means3D.size(0) <= static_cast<int64_t>(INT_MAX),
+		"Gaussian row count exceeds the int32 raster ABI");
+
+	TORCH_CHECK(input.is_cuda(), "packed head_input must be a CUDA tensor");
+	TORCH_CHECK(weights.is_cuda(), "packed head_weights must be a CUDA tensor");
+	TORCH_CHECK(biases.is_cuda(), "packed head_biases must be a CUDA tensor");
+	TORCH_CHECK(input.is_contiguous(), "packed head_input must be contiguous");
+	TORCH_CHECK(weights.is_contiguous(), "packed head_weights must be contiguous");
+	TORCH_CHECK(biases.is_contiguous(), "packed head_biases must be contiguous");
+	TORCH_CHECK(input.scalar_type() == at::kHalf,
+		"packed head_input must be float16");
+	TORCH_CHECK(weights.scalar_type() == at::kHalf,
+		"packed head_weights must be float16");
+	TORCH_CHECK(biases.scalar_type() == at::kFloat,
+		"packed head_biases must be float32");
+	TORCH_CHECK(
+		input.dim() == 2 && input.size(1) == 128,
+		"packed head_input must have shape [N, 128]");
+	TORCH_CHECK(
+		weights.size(1) == 128 && weights.size(2) == 128,
+		"packed head_weights must have shape [H, 128, 128]");
+	TORCH_CHECK(
+		biases.dim() == 2 && biases.size(0) == head_count &&
+			biases.size(1) == 128,
+		"packed head_biases must have shape [H, 128]");
+	TORCH_CHECK(
+		means3D.device() == input.device() &&
+			input.device() == weights.device() &&
+			input.device() == biases.device(),
+		"raster and packed head tensors must be on the same CUDA device");
+	TORCH_CHECK(
+		input.size(0) <= static_cast<int64_t>(INT_MAX),
+		"packed head row count exceeds the int32 mixed ABI v3");
+	TORCH_CHECK(
+		isNativeWmmaAligned(input),
+		"packed head_input data pointer must be natively 32-byte aligned");
+	TORCH_CHECK(
+		isNativeWmmaAligned(weights),
+		"packed head_weights data pointer must be natively 32-byte aligned");
+	TORCH_CHECK(
+		isNativeWmmaAligned(biases),
+		"packed head_biases data pointer must be natively 32-byte aligned");
+}
+
+void checkMixedWholeHeadsArguments(
+	const torch::Tensor& means3D,
+	const std::vector<torch::Tensor>& inputs,
+	const std::vector<torch::Tensor>& first_weights,
+	const std::vector<torch::Tensor>& first_biases,
+	const std::vector<torch::Tensor>& tail_weights,
+	const std::vector<torch::Tensor>& tail_biases,
+	int64_t worker_groups,
+	int64_t persistent_blocks)
+{
+	TORCH_CHECK(
+		!at::GradMode::is_enabled(),
+		"rasterize_gaussians_with_whole_heads is inference-only; "
+		"call it under torch.no_grad()");
+	TORCH_CHECK(
+		inputs.size() == first_weights.size() &&
+			inputs.size() == first_biases.size() &&
+			inputs.size() == tail_weights.size() &&
+			inputs.size() == tail_biases.size(),
+		"whole-head inputs and parameter lists must have equal lengths");
+	TORCH_CHECK(
+		!inputs.empty() &&
+			inputs.size() <=
+				static_cast<std::size_t>(CudaRasterizer::Tacker::kMaxHeadTasksV2),
+		"mixed whole-head ABI v4 requires between 1 and 5 tasks");
+	TORCH_CHECK(
+		worker_groups >= CudaRasterizer::Tacker::kMinWorkerGroupsV2 &&
+			worker_groups <= static_cast<int64_t>(inputs.size()),
+		"whole-head worker_groups must be in [1, task_count]");
+	TORCH_CHECK(persistent_blocks >= 0, "persistent_blocks must be >= 0");
+	TORCH_CHECK(
+		persistent_blocks <= static_cast<int64_t>(INT_MAX),
+		"persistent_blocks exceeds the int32 mixed whole-head ABI v4");
+	TORCH_CHECK(
+		means3D.size(0) <= static_cast<int64_t>(INT_MAX),
+		"Gaussian row count exceeds the int32 raster ABI");
+
+	for (std::size_t task_index = 0; task_index < inputs.size(); ++task_index)
+	{
+		const torch::Tensor& input = inputs[task_index];
+		const torch::Tensor& first_weight = first_weights[task_index];
+		const torch::Tensor& first_bias = first_biases[task_index];
+		const torch::Tensor& tail_weight = tail_weights[task_index];
+		const torch::Tensor& tail_bias = tail_biases[task_index];
+		for (const torch::Tensor* tensor : {
+				&input, &first_weight, &first_bias, &tail_weight, &tail_bias})
+		{
+			TORCH_CHECK(tensor->is_cuda(),
+				"whole-head task ", task_index, " tensors must be CUDA tensors");
+			TORCH_CHECK(tensor->is_contiguous(),
+				"whole-head task ", task_index, " tensors must be contiguous");
+			TORCH_CHECK(isNativeWmmaAligned(*tensor),
+				"whole-head task ", task_index,
+				" tensor data pointers must be natively 32-byte aligned");
+		}
+		TORCH_CHECK(input.scalar_type() == at::kHalf,
+			"whole-head inputs[", task_index, "] must be float16");
+		TORCH_CHECK(first_weight.scalar_type() == at::kHalf,
+			"whole-head first_weights[", task_index, "] must be float16");
+		TORCH_CHECK(first_bias.scalar_type() == at::kFloat,
+			"whole-head first_biases[", task_index, "] must be float32");
+		TORCH_CHECK(tail_weight.scalar_type() == at::kFloat,
+			"whole-head tail_weights[", task_index, "] must be float32");
+		TORCH_CHECK(tail_bias.scalar_type() == at::kFloat,
+			"whole-head tail_biases[", task_index, "] must be float32");
+		TORCH_CHECK(
+			input.dim() == 2 && input.size(1) == 128,
+			"whole-head inputs[", task_index, "] must have shape [N, 128]");
+		TORCH_CHECK(
+			first_weight.dim() == 2 && first_weight.size(0) == 128 &&
+				first_weight.size(1) == 128,
+			"whole-head first_weights[", task_index,
+			"] must have shape [128, 128]");
+		TORCH_CHECK(
+			first_bias.dim() == 1 && first_bias.size(0) == 128,
+			"whole-head first_biases[", task_index,
+			"] must have shape [128]");
+		TORCH_CHECK(
+			tail_weight.dim() == 2 && tail_weight.size(1) == 128 &&
+				tail_weight.size(0) >= 1 &&
+				tail_weight.size(0) <= CudaRasterizer::Tacker::kMaxTailFeaturesV2,
+			"whole-head tail_weights[", task_index,
+			"] must have shape [O, 128] with 1 <= O <= 128");
+		TORCH_CHECK(
+			tail_bias.dim() == 1 && tail_bias.size(0) == tail_weight.size(0),
+			"whole-head tail_biases[", task_index, "] must have shape [O]");
+		TORCH_CHECK(
+			means3D.device() == input.device() &&
+				input.device() == first_weight.device() &&
+				input.device() == first_bias.device() &&
+				input.device() == tail_weight.device() &&
+				input.device() == tail_bias.device(),
+			"raster and whole-head task ", task_index,
+			" tensors must be on the same CUDA device");
+		TORCH_CHECK(
+			input.size(0) <= static_cast<int64_t>(INT_MAX),
+			"whole-head inputs[", task_index,
+			"] row count exceeds the int32 mixed ABI v4");
+	}
+}
+
+using MixedRasterResult = std::tuple<int, torch::Tensor, torch::Tensor,
+	torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>;
+
+MixedRasterResult rasterizeWithNewMixedBackend(
+	const MixedRasterChoices& raster_choices,
+	const torch::Tensor& background,
+	const torch::Tensor& means3D,
+	const torch::Tensor& colors,
+	const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+	const int image_height,
+	const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const bool debug,
+	const CudaRasterizer::MixedPackedHeadBundleV2* packed_heads,
+	const CudaRasterizer::MixedWholeHeadBundleV2* whole_heads)
+{
+	TORCH_CHECK(
+		(packed_heads != nullptr) != (whole_heads != nullptr),
+		"exactly one C3/C4 mixed backend must be selected");
+	const c10::cuda::CUDAGuard device_guard(means3D.device());
+	const int P = static_cast<int>(means3D.size(0));
+	const int H = image_height;
+	const int W = image_width;
+	auto float_opts = means3D.options().dtype(torch::kFloat32);
+	torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
+	torch::Tensor out_depth = torch::full({1, H, W}, 0.0, float_opts);
+	torch::Tensor radii = torch::full(
+		{P}, 0, means3D.options().dtype(torch::kInt32));
+	const torch::TensorOptions byte_options =
+		means3D.options().dtype(torch::kByte);
+	torch::Tensor geomBuffer = torch::empty({0}, byte_options);
+	torch::Tensor binningBuffer = torch::empty({0}, byte_options);
+	torch::Tensor imgBuffer = torch::empty({0}, byte_options);
+	std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
+	std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
+	std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
+
+	const cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+	const torch::Tensor background_contiguous = background.contiguous();
+	int rendered = 0;
+	if (P != 0)
+	{
+		const int M = raster_choices.use_sh ? static_cast<int>(sh.size(1)) : 0;
+		const torch::Tensor means3D_contiguous = means3D.contiguous();
+		const torch::Tensor sh_contiguous = sh.contiguous();
+		const torch::Tensor colors_contiguous = colors.contiguous();
+		const torch::Tensor opacity_contiguous = opacity.contiguous();
+		const torch::Tensor scales_contiguous = scales.contiguous();
+		const torch::Tensor rotations_contiguous = rotations.contiguous();
+		const torch::Tensor cov3D_contiguous = cov3D_precomp.contiguous();
+		const torch::Tensor viewmatrix_contiguous = viewmatrix.contiguous();
+		const torch::Tensor projmatrix_contiguous = projmatrix.contiguous();
+		const torch::Tensor campos_contiguous = campos.contiguous();
+		const float* sh_ptr = raster_choices.use_sh
+			? sh_contiguous.data_ptr<float>() : nullptr;
+		const float* colors_ptr = raster_choices.use_sh
+			? nullptr : colors_contiguous.data_ptr<float>();
+		const float* scales_ptr = raster_choices.use_cov3d
+			? nullptr : scales_contiguous.data_ptr<float>();
+		const float* rotations_ptr = raster_choices.use_cov3d
+			? nullptr : rotations_contiguous.data_ptr<float>();
+		const float* cov3D_ptr = raster_choices.use_cov3d
+			? cov3D_contiguous.data_ptr<float>() : nullptr;
+
+		rendered = CudaRasterizer::Rasterizer::forward(
+			geomFunc, binningFunc, imgFunc,
+			P, degree, M,
+			background_contiguous.data_ptr<float>(),
+			W, H,
+			means3D_contiguous.data_ptr<float>(),
+			sh_ptr,
+			colors_ptr,
+			opacity_contiguous.data_ptr<float>(),
+			scales_ptr,
+			scale_modifier,
+			rotations_ptr,
+			cov3D_ptr,
+			viewmatrix_contiguous.data_ptr<float>(),
+			projmatrix_contiguous.data_ptr<float>(),
+			campos_contiguous.data_ptr<float>(),
+			tan_fovx, tan_fovy,
+			prefiltered,
+			out_color.data_ptr<float>(),
+			out_depth.data_ptr<float>(),
+			radii.data_ptr<int>(),
+			debug,
+			stream,
+			nullptr,
+			nullptr,
+			packed_heads,
+			whole_heads);
+	}
+	else if (packed_heads != nullptr)
+	{
+		CudaRasterizer::Tacker::launchMixedRenderPackedHeads(
+			dim3(0, 0, 1), nullptr, nullptr, W, H, nullptr, nullptr,
+			nullptr, nullptr, nullptr, nullptr,
+			background_contiguous.data_ptr<float>(),
+			out_color.data_ptr<float>(), out_depth.data_ptr<float>(),
+			*packed_heads, stream);
+	}
+	else
+	{
+		CudaRasterizer::Tacker::launchMixedRenderWholeHeads(
+			dim3(0, 0, 1), nullptr, nullptr, W, H, nullptr, nullptr,
+			nullptr, nullptr, nullptr, nullptr,
+			background_contiguous.data_ptr<float>(),
+			out_color.data_ptr<float>(), out_depth.data_ptr<float>(),
+			*whole_heads, stream);
+	}
+
+	bool backend_has_rows = packed_heads != nullptr
+		? packed_heads->rows > 0
+		: false;
+	if (whole_heads != nullptr)
+	{
+		for (int task_index = 0; task_index < whole_heads->task_count; ++task_index)
+			backend_has_rows = backend_has_rows ||
+				whole_heads->tasks[task_index].rows > 0;
+	}
+	if (P != 0 || backend_has_rows)
+	{
+		const cudaError_t status = cudaGetLastError();
+		TORCH_CHECK(
+			status == cudaSuccess,
+			"C3/C4 mixed Raster launch failed: ", cudaGetErrorString(status));
+	}
+	return std::make_tuple(
+		rendered, out_color, out_depth, radii,
+		geomBuffer, binningBuffer, imgBuffer);
 }
 
 }  // namespace
@@ -825,6 +1165,250 @@ RasterizeGaussiansWithHeadsCUDA(
 		binningBuffer,
 		imgBuffer,
 		head_outputs);
+}
+
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+	torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeGaussiansWithPackedHeadsCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& means3D,
+	const torch::Tensor& colors,
+	const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+	const int image_height,
+	const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const bool debug,
+	const torch::Tensor& head_input,
+	const torch::Tensor& head_weights,
+	const torch::Tensor& head_biases,
+	const int64_t worker_groups,
+	const int64_t persistent_blocks)
+{
+	const MixedRasterChoices raster_choices = checkMixedRasterArguments(
+		background, means3D, colors, opacity, scales, rotations,
+		cov3D_precomp, viewmatrix, projmatrix, sh, campos, degree);
+	checkMixedPackedHeadsArguments(
+		means3D, head_input, head_weights, head_biases,
+		worker_groups, persistent_blocks);
+	checkRasterDimensions(image_height, image_width);
+
+	const c10::cuda::CUDAGuard device_guard(means3D.device());
+	torch::Tensor head_output = torch::empty(
+		{head_weights.size(0), head_input.size(0), 128},
+		head_input.options().dtype(torch::kFloat32));
+	TORCH_CHECK(
+		isNativeWmmaAligned(head_output),
+		"packed head_output data pointer must be natively 32-byte aligned");
+	TORCH_CHECK(
+		!tensorByteRangesOverlap(head_output, head_input) &&
+			!tensorByteRangesOverlap(head_output, head_weights) &&
+			!tensorByteRangesOverlap(head_output, head_biases),
+		"packed head_output must not alias input, weights, or biases");
+
+	CudaRasterizer::MixedPackedHeadBundleV2 head_bundle = {
+		reinterpret_cast<const void*>(head_input.data_ptr<at::Half>()),
+		reinterpret_cast<const void*>(head_weights.data_ptr<at::Half>()),
+		head_biases.data_ptr<float>(),
+		head_output.data_ptr<float>(),
+		static_cast<int>(head_input.size(0)),
+		static_cast<int>(head_weights.size(0)),
+		static_cast<int>(worker_groups),
+		static_cast<int>(persistent_blocks)};
+
+	int rendered;
+	torch::Tensor out_color;
+	torch::Tensor out_depth;
+	torch::Tensor radii;
+	torch::Tensor geom_buffer;
+	torch::Tensor binning_buffer;
+	torch::Tensor image_buffer;
+	std::tie(
+		rendered, out_color, out_depth, radii,
+		geom_buffer, binning_buffer, image_buffer) =
+		rasterizeWithNewMixedBackend(
+			raster_choices,
+			background, means3D, colors, opacity, scales, rotations,
+			scale_modifier, cov3D_precomp, viewmatrix, projmatrix,
+			tan_fovx, tan_fovy, image_height, image_width,
+			sh, degree, campos, prefiltered, debug,
+			&head_bundle, nullptr);
+	return std::make_tuple(
+		rendered, out_color, out_depth, radii,
+		geom_buffer, binning_buffer, image_buffer, head_output);
+}
+
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+	torch::Tensor, torch::Tensor, std::vector<torch::Tensor>>
+RasterizeGaussiansWithWholeHeadsCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& means3D,
+	const torch::Tensor& colors,
+	const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+	const int image_height,
+	const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const bool debug,
+	const std::vector<torch::Tensor>& head_inputs,
+	const std::vector<torch::Tensor>& first_weights,
+	const std::vector<torch::Tensor>& first_biases,
+	const std::vector<torch::Tensor>& tail_weights,
+	const std::vector<torch::Tensor>& tail_biases,
+	const int64_t worker_groups,
+	const int64_t persistent_blocks)
+{
+	const MixedRasterChoices raster_choices = checkMixedRasterArguments(
+		background, means3D, colors, opacity, scales, rotations,
+		cov3D_precomp, viewmatrix, projmatrix, sh, campos, degree);
+	checkMixedWholeHeadsArguments(
+		means3D, head_inputs, first_weights, first_biases,
+		tail_weights, tail_biases, worker_groups, persistent_blocks);
+	checkRasterDimensions(image_height, image_width);
+
+	const c10::cuda::CUDAGuard device_guard(means3D.device());
+	std::vector<torch::Tensor> head_outputs;
+	head_outputs.reserve(head_inputs.size());
+	for (std::size_t task_index = 0; task_index < head_inputs.size(); ++task_index)
+	{
+		head_outputs.push_back(torch::empty(
+			{head_inputs[task_index].size(0), tail_weights[task_index].size(0)},
+			head_inputs[task_index].options().dtype(torch::kFloat32)));
+		TORCH_CHECK(
+			isNativeWmmaAligned(head_outputs.back()),
+			"whole-head outputs[", task_index,
+			"] data pointer must be natively 32-byte aligned");
+		for (std::size_t parameter_task = 0;
+			 parameter_task < head_inputs.size(); ++parameter_task)
+		{
+			TORCH_CHECK(
+				!tensorByteRangesOverlap(
+					head_outputs.back(), head_inputs[parameter_task]) &&
+				!tensorByteRangesOverlap(
+					head_outputs.back(), first_weights[parameter_task]) &&
+				!tensorByteRangesOverlap(
+					head_outputs.back(), first_biases[parameter_task]) &&
+				!tensorByteRangesOverlap(
+					head_outputs.back(), tail_weights[parameter_task]) &&
+				!tensorByteRangesOverlap(
+					head_outputs.back(), tail_biases[parameter_task]),
+				"whole-head output ", task_index,
+				" must not alias any input or parameter");
+		}
+		for (std::size_t other = 0; other < task_index; ++other)
+		{
+			TORCH_CHECK(
+				!tensorByteRangesOverlap(head_outputs.back(), head_outputs[other]),
+				"whole-head outputs must not alias each other");
+		}
+	}
+
+	CudaRasterizer::MixedWholeHeadBundleV2 head_bundle = {};
+	head_bundle.task_count = static_cast<int>(head_inputs.size());
+	head_bundle.worker_groups = static_cast<int>(worker_groups);
+	head_bundle.persistent_blocks = static_cast<int>(persistent_blocks);
+	for (std::size_t task_index = 0; task_index < head_inputs.size(); ++task_index)
+	{
+		head_bundle.tasks[task_index] = {
+			reinterpret_cast<const void*>(
+				head_inputs[task_index].data_ptr<at::Half>()),
+			reinterpret_cast<const void*>(
+				first_weights[task_index].data_ptr<at::Half>()),
+			first_biases[task_index].data_ptr<float>(),
+			tail_weights[task_index].data_ptr<float>(),
+			tail_biases[task_index].data_ptr<float>(),
+			head_outputs[task_index].data_ptr<float>(),
+			static_cast<int>(head_inputs[task_index].size(0)),
+			static_cast<int>(tail_weights[task_index].size(0))};
+	}
+
+	int rendered;
+	torch::Tensor out_color;
+	torch::Tensor out_depth;
+	torch::Tensor radii;
+	torch::Tensor geom_buffer;
+	torch::Tensor binning_buffer;
+	torch::Tensor image_buffer;
+	std::tie(
+		rendered, out_color, out_depth, radii,
+		geom_buffer, binning_buffer, image_buffer) =
+		rasterizeWithNewMixedBackend(
+			raster_choices,
+			background, means3D, colors, opacity, scales, rotations,
+			scale_modifier, cov3D_precomp, viewmatrix, projmatrix,
+			tan_fovx, tan_fovy, image_height, image_width,
+			sh, degree, campos, prefiltered, debug,
+			nullptr, &head_bundle);
+	return std::make_tuple(
+		rendered, out_color, out_depth, radii,
+		geom_buffer, binning_buffer, image_buffer, head_outputs);
+}
+
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+	torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeGaussiansWithWholeHeadCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& means3D,
+	const torch::Tensor& colors,
+	const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+	const int image_height,
+	const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const bool debug,
+	const torch::Tensor& head_input,
+	const torch::Tensor& first_weight,
+	const torch::Tensor& first_bias,
+	const torch::Tensor& tail_weight,
+	const torch::Tensor& tail_bias,
+	const int64_t persistent_blocks)
+{
+	auto result = RasterizeGaussiansWithWholeHeadsCUDA(
+		background, means3D, colors, opacity, scales, rotations,
+		scale_modifier, cov3D_precomp, viewmatrix, projmatrix,
+		tan_fovx, tan_fovy, image_height, image_width,
+		sh, degree, campos, prefiltered, debug,
+		std::vector<torch::Tensor>{head_input},
+		std::vector<torch::Tensor>{first_weight},
+		std::vector<torch::Tensor>{first_bias},
+		std::vector<torch::Tensor>{tail_weight},
+		std::vector<torch::Tensor>{tail_bias},
+		1,
+		persistent_blocks);
+	return std::make_tuple(
+		std::get<0>(result), std::get<1>(result), std::get<2>(result),
+		std::get<3>(result), std::get<4>(result), std::get<5>(result),
+		std::get<6>(result), std::get<7>(result).front());
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

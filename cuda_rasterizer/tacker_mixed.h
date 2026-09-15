@@ -25,17 +25,30 @@ static const int kRasterBarrierId = 1;
 // 128-thread worker groups.  The worker groups execute 1--5 first-linear head
 // tasks using tacker_ext's stable multi-task device adapter.
 static const int kMixedMultiAbiVersion = 2;
+static const int kMixedPackedAbiVersion = 3;
+static const int kMixedWholeHeadAbiVersion = 4;
 static const int kMaxHeadTasksV2 = 5;
 static const int kMinWorkerGroupsV2 = 1;
 static const int kMaxWorkerGroupsV2 = 5;
 static const int kWorkerGroupThreadsV2 = 128;
 static const int kHeadDescriptorBarrierIdV2 = 2;
+static const int kWholeHeadBarrierBaseIdV2 = 2;
+static const int kWholeHeadDescriptorBarrierIdV2 = 7;
+static const int kMaxTailFeaturesV2 = 128;
 static const int kMaxMixedThreadsV2 =
 	kRasterThreads + kMaxWorkerGroupsV2 * kWorkerGroupThreadsV2;
+
+enum class MixedBackendFamily
+{
+	FirstLinear,
+	PackedFirstLinear,
+	WholeHead
+};
 
 struct MixedKernelResources
 {
 	int abi_version;
+	MixedBackendFamily backend_family;
 	int worker_groups;
 	int physical_threads;
 	int device_ordinal;
@@ -100,12 +113,59 @@ void launchMixedRenderHeads(
 	const MixedHeadBundleV2& heads,
 	cudaStream_t stream);
 
+// C3 packed shared-input first-linear backend.  One output tensor stores
+// [head_count, rows, 128] contiguously and every logical head executes once.
+void launchMixedRenderPackedHeads(
+	const dim3 raster_grid,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int width,
+	int height,
+	const float2* points_xy_image,
+	const float* features,
+	const float* depths,
+	const float4* conic_opacity,
+	float* final_T,
+	uint32_t* n_contrib,
+	const float* background,
+	float* out_color,
+	float* out_depth,
+	const MixedPackedHeadBundleV2& heads,
+	cudaStream_t stream);
+
+// C4 single/multi whole-head backend.  task_count==1 is the physical
+// single-head configuration; larger bundles use 1--5 independent groups.
+void launchMixedRenderWholeHeads(
+	const dim3 raster_grid,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int width,
+	int height,
+	const float2* points_xy_image,
+	const float* features,
+	const float* depths,
+	const float4* conic_opacity,
+	float* final_T,
+	uint32_t* n_contrib,
+	const float* background,
+	float* out_color,
+	float* out_depth,
+	const MixedWholeHeadBundleV2& heads,
+	cudaStream_t stream);
+
 // Runtime resource/capability query used by offline candidate filtering.
-// ABI v1 requires worker_groups==1; ABI v2 accepts [1, 5].  This call queries
-// the active device and does not launch or synchronize a kernel.
+// ABI v1 requires worker_groups==1; ABI v2/v3/v4 accept [1, 5].  This call
+// queries the active device and does not launch or synchronize a kernel.
 MixedKernelResources queryMixedKernelResources(
 	int abi_version,
 	int worker_groups);
+
+MixedKernelResources queryMixedKernelResources(
+	int abi_version,
+	int worker_groups,
+	MixedBackendFamily family);
+
+const char* mixedBackendFamilyName(MixedBackendFamily family);
 
 }  // namespace Tacker
 }  // namespace CudaRasterizer

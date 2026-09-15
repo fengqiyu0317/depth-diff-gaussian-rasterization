@@ -137,6 +137,73 @@ class MixedKernelContractTest(unittest.TestCase):
             len(hashlib.sha256(manifest_text.encode("utf-8")).hexdigest()), 64
         )
 
+    def test_c3_packed_wrapper_uses_adapter_without_backend_barrier(self):
+        header = source("cuda_rasterizer/tacker_mixed.h")
+        cuda = source("cuda_rasterizer/tacker_mixed.cu")
+        manifest = json.loads(
+            source("abi/tacker_mixed_render_packed_heads_v3.json")
+        )
+        self.assertIn("kMixedPackedAbiVersion = 3", header)
+        self.assertIn("tacker_mix_render_packed_heads_v3", cuda)
+        self.assertIn("head_linear_packed_gptb_device", cuda)
+        self.assertEqual(manifest["abi_version"], 3)
+        self.assertEqual(manifest["backend_family"], "packed_first_linear_v3")
+        self.assertEqual(
+            manifest["global_kernel_symbol"],
+            "tacker_mix_render_packed_heads_v3",
+        )
+        self.assertEqual(
+            manifest["subgroups"]["head_workers"]["named_barrier_ids"], []
+        )
+        self.assertFalse(
+            manifest["subgroups"]["head_workers"]["cta_wide_barriers"]
+        )
+
+    def test_c4_whole_wrapper_has_exact_disjoint_barriers_and_scratch(self):
+        header = source("cuda_rasterizer/tacker_mixed.h")
+        cuda = source("cuda_rasterizer/tacker_mixed.cu")
+        manifest = json.loads(
+            source("abi/tacker_mixed_render_whole_heads_v4.json")
+        )
+        self.assertIn("kMixedWholeHeadAbiVersion = 4", header)
+        self.assertIn("kWholeHeadBarrierBaseIdV2 = 2", header)
+        self.assertIn("kWholeHeadDescriptorBarrierIdV2 = 7", header)
+        self.assertIn("tacker_mix_render_whole_heads_v4", cuda)
+        self.assertIn("whole_head_multi_gptb_device", cuda)
+        self.assertIn("backend_threads", cuda)
+        self.assertEqual(manifest["abi_version"], 4)
+        workers = manifest["subgroups"]["head_workers"]
+        self.assertEqual(workers["worker_named_barrier_ids"], "[2, 1 + worker_groups]")
+        self.assertEqual(workers["worker_barrier_participants"], 128)
+        self.assertEqual(workers["descriptor_named_barrier_id"], 7)
+        self.assertEqual(
+            workers["descriptor_barrier_participants"], "worker_groups * 128"
+        )
+        self.assertEqual(
+            manifest["physical_launch"][
+                "static_shared_scratch_bytes_per_worker_group"
+            ],
+            512,
+        )
+        self.assertNotIn("__syncthreads(", cuda)
+
+    def test_c3_c4_manifests_preserve_old_abi_artifacts(self):
+        expected = [
+            "abi/tacker_mixed_render_head_v1.json",
+            "abi/tacker_mixed_render_heads_v2.json",
+        ]
+        for path in (
+            "abi/tacker_mixed_render_packed_heads_v3.json",
+            "abi/tacker_mixed_render_whole_heads_v4.json",
+        ):
+            with self.subTest(path=path):
+                manifest = json.loads(source(path))
+                self.assertEqual(manifest["preserved_abis"], expected)
+                self.assertEqual(
+                    manifest["tacker_ext_dependency"]["manifest_sha256"],
+                    manifest_sha256("../../tacker_ext/abi/head_linear_v2.json"),
+                )
+
 
 class ExtensionApiContractTest(unittest.TestCase):
     def test_old_binding_and_forward_path_remain(self):
@@ -191,6 +258,18 @@ class ExtensionApiContractTest(unittest.TestCase):
             "head_multi_manifest_sha256": (
                 "../../tacker_ext/abi/head_linear_v2.json"
             ),
+            "mixed_packed_manifest_sha256": (
+                "abi/tacker_mixed_render_packed_heads_v3.json"
+            ),
+            "mixed_packed_head_manifest_sha256": (
+                "../../tacker_ext/abi/head_linear_v2.json"
+            ),
+            "mixed_whole_manifest_sha256": (
+                "abi/tacker_mixed_render_whole_heads_v4.json"
+            ),
+            "mixed_whole_head_manifest_sha256": (
+                "../../tacker_ext/abi/head_linear_v2.json"
+            ),
         }
         for capability, manifest_path in manifest_by_capability.items():
             with self.subTest(capability=capability):
@@ -215,6 +294,77 @@ class ExtensionApiContractTest(unittest.TestCase):
             self.assertIn(required, binding)
         self.assertIn("MixedHeadBundleV2 head_bundle = {}", binding)
         self.assertIn("any_head_rows", binding)
+
+    def test_c3_c4_bindings_methods_and_capabilities_are_exposed(self):
+        extension = source("ext.cpp")
+        python_api = source("diff_gaussian_rasterization/__init__.py")
+        header = source("rasterize_points.h")
+        for name in (
+            "rasterize_gaussians_with_packed_heads",
+            "rasterize_gaussians_with_whole_head",
+            "rasterize_gaussians_with_whole_heads",
+        ):
+            self.assertIn(name, extension)
+        for name in (
+            "RasterizeGaussiansWithPackedHeadsCUDA",
+            "RasterizeGaussiansWithWholeHeadCUDA",
+            "RasterizeGaussiansWithWholeHeadsCUDA",
+        ):
+            self.assertIn(name, header)
+        self.assertIn("def forward_with_packed_heads(", python_api)
+        self.assertIn("packed_head_weights", python_api)
+        self.assertIn("packed_head_biases", python_api)
+        self.assertIn("def forward_with_whole_head(", python_api)
+        self.assertIn("def forward_with_whole_heads(", python_api)
+        self.assertIn("output_widths", python_api)
+        for key in (
+            "mixed_render_packed_heads_abi",
+            "mixed_render_packed_heads",
+            "mixed_packed_symbol",
+            "mixed_packed_manifest_sha256",
+            "mixed_render_whole_heads_abi",
+            "mixed_render_whole_heads",
+            "mixed_whole_symbol",
+            "mixed_whole_manifest_sha256",
+            "supported_backend_families",
+            "resource_query_family_aware",
+        ):
+            self.assertIn(key, extension)
+
+    def test_c3_c4_cpp_validation_is_fail_closed(self):
+        binding = source("rasterize_points.cu")
+        for required in (
+            "packed head count must be in [1, 5]",
+            "packed worker_groups must be in [1, head_count]",
+            "packed head_input must have shape [N, 128]",
+            "packed head_weights must have shape [H, 128, 128]",
+            "packed head_biases must have shape [H, 128]",
+            "packed head_output must not alias input, weights, or biases",
+            "whole-head inputs and parameter lists must have equal lengths",
+            "mixed whole-head ABI v4 requires between 1 and 5 tasks",
+            "must have shape [O, 128] with 1 <= O <= 128",
+            "whole-head outputs must not alias each other",
+            "must not alias any input or parameter",
+            "persistent_blocks exceeds the int32 mixed whole-head ABI v4",
+        ):
+            self.assertIn(required, binding)
+        self.assertGreaterEqual(binding.count("natively 32-byte aligned"), 8)
+
+    def test_resource_query_is_abi_and_family_specific(self):
+        extension = source("ext.cpp")
+        cuda = source("cuda_rasterizer/tacker_mixed.cu")
+        python_api = source("diff_gaussian_rasterization/__init__.py")
+        for family in (
+            "first_linear_heads_v2",
+            "packed_first_linear_v3",
+            "whole_heads_v4",
+        ):
+            self.assertIn(family, extension + cuda + python_api)
+        self.assertIn('result["backend_abi_version"]', extension)
+        self.assertIn('result["backend_family"]', extension)
+        self.assertIn('result["family"]', extension)
+        self.assertIn("backend family does not match", extension)
+        self.assertIn("family=family", python_api)
 
     def test_v2_resources_include_register_smem_and_occupancy(self):
         cuda = source("cuda_rasterizer/tacker_mixed.cu")

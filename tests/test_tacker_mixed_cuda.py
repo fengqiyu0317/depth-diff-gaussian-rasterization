@@ -29,6 +29,40 @@ def _mixed_v2_available():
     )
 
 
+def _mixed_c3_c4_available():
+    return (
+        _mixed_v2_available()
+        and hasattr(_C, "rasterize_gaussians_with_packed_heads")
+        and hasattr(_C, "rasterize_gaussians_with_whole_head")
+        and hasattr(_C, "rasterize_gaussians_with_whole_heads")
+    )
+
+
+def _empty_raster_prefix(device):
+    float_options = {"device": device, "dtype": torch.float32}
+    return (
+        torch.zeros((3,), **float_options),
+        torch.empty((0, 3), **float_options),
+        torch.empty((0, 3), **float_options),
+        torch.empty((0, 1), **float_options),
+        torch.empty((0,), **float_options),
+        torch.empty((0,), **float_options),
+        1.0,
+        torch.empty((0, 6), **float_options),
+        torch.eye(4, **float_options),
+        torch.eye(4, **float_options),
+        1.0,
+        1.0,
+        16,
+        16,
+        torch.empty((0,), **float_options),
+        0,
+        torch.zeros((3,), **float_options),
+        False,
+        False,
+    )
+
+
 @unittest.skipUnless(_mixed_available(), "mixed CUDA extension required")
 class MixedCudaBoundaryTest(unittest.TestCase):
     @staticmethod
@@ -295,6 +329,243 @@ class MixedV2CudaBoundaryTest(unittest.TestCase):
         # pybind11 maps the launcher's std::invalid_argument to ValueError.
         with self.assertRaisesRegex(ValueError, "worker_groups"):
             _C.tacker_resource_requirements(2, 6)
+
+
+@unittest.skipUnless(_mixed_c3_c4_available(), "mixed CUDA ABI v3/v4 required")
+class MixedC3C4CudaBoundaryTest(unittest.TestCase):
+    @staticmethod
+    def _packed_args(input_tensor, weights, biases, worker_groups=1, blocks=1):
+        return _empty_raster_prefix(input_tensor.device) + (
+            input_tensor,
+            weights,
+            biases,
+            worker_groups,
+            blocks,
+        )
+
+    @staticmethod
+    def _whole_args(
+        inputs,
+        first_weights,
+        first_biases,
+        tail_weights,
+        tail_biases,
+        worker_groups=1,
+        blocks=1,
+    ):
+        return _empty_raster_prefix(inputs[0].device) + (
+            list(inputs),
+            list(first_weights),
+            list(first_biases),
+            list(tail_weights),
+            list(tail_biases),
+            worker_groups,
+            blocks,
+        )
+
+    def test_c3_packed_empty_tail_and_parallel_heads_match_reference(self):
+        generator = torch.Generator(device="cuda").manual_seed(20260913)
+        for rows, head_count, worker_groups in (
+            (0, 2, 1),
+            (1, 2, 2),
+            (17, 5, 1),
+            (33, 5, 5),
+        ):
+            input_tensor = torch.randn(
+                rows,
+                128,
+                device="cuda",
+                dtype=torch.float16,
+                generator=generator,
+            ) * 0.05
+            weights = torch.randn(
+                head_count,
+                128,
+                128,
+                device="cuda",
+                dtype=torch.float16,
+                generator=generator,
+            ) * 0.05
+            biases = torch.randn(
+                head_count,
+                128,
+                device="cuda",
+                dtype=torch.float32,
+                generator=generator,
+            ) * 0.05
+            reference = torch.stack(
+                [
+                    torch.nn.functional.linear(
+                        input_tensor.float(), weights[index].float(), biases[index]
+                    )
+                    for index in range(head_count)
+                ]
+            )
+            with torch.no_grad():
+                result = _C.rasterize_gaussians_with_packed_heads(
+                    *self._packed_args(
+                        input_tensor, weights, biases, worker_groups, blocks=3
+                    )
+                )[-1]
+            torch.testing.assert_close(result, reference, atol=2e-3, rtol=2e-3)
+
+    def test_c4_single_multi_empty_and_variable_tail_widths_match_reference(self):
+        generator = torch.Generator(device="cuda").manual_seed(20260914)
+        rows = (0, 1, 17, 33)
+        widths = (1, 3, 48, 128)
+        inputs = []
+        first_weights = []
+        first_biases = []
+        tail_weights = []
+        tail_biases = []
+        references = []
+        for row_count, width in zip(rows, widths):
+            input_tensor = torch.randn(
+                row_count,
+                128,
+                device="cuda",
+                dtype=torch.float16,
+                generator=generator,
+            ) * 0.05
+            first_weight = torch.randn(
+                128,
+                128,
+                device="cuda",
+                dtype=torch.float16,
+                generator=generator,
+            ) * 0.05
+            first_bias = torch.randn(
+                128, device="cuda", dtype=torch.float32, generator=generator
+            ) * 0.05
+            tail_weight = torch.randn(
+                width,
+                128,
+                device="cuda",
+                dtype=torch.float32,
+                generator=generator,
+            ) * 0.05
+            tail_bias = torch.randn(
+                width, device="cuda", dtype=torch.float32, generator=generator
+            ) * 0.05
+            hidden = torch.relu(
+                torch.nn.functional.linear(
+                    input_tensor.float(), first_weight.float(), first_bias
+                )
+            )
+            references.append(
+                torch.nn.functional.linear(hidden, tail_weight, tail_bias)
+            )
+            inputs.append(input_tensor)
+            first_weights.append(first_weight)
+            first_biases.append(first_bias)
+            tail_weights.append(tail_weight)
+            tail_biases.append(tail_bias)
+
+        with torch.no_grad():
+            for worker_groups in (1, 4):
+                outputs = _C.rasterize_gaussians_with_whole_heads(
+                    *self._whole_args(
+                        inputs,
+                        first_weights,
+                        first_biases,
+                        tail_weights,
+                        tail_biases,
+                        worker_groups,
+                        blocks=3,
+                    )
+                )[-1]
+                for output, reference in zip(outputs, references):
+                    torch.testing.assert_close(
+                        output, reference, atol=2e-3, rtol=2e-3
+                    )
+
+            single = _C.rasterize_gaussians_with_whole_head(
+                *(_empty_raster_prefix("cuda") + (
+                    inputs[-1],
+                    first_weights[-1],
+                    first_biases[-1],
+                    tail_weights[-1],
+                    tail_biases[-1],
+                    3,
+                ))
+            )[-1]
+        torch.testing.assert_close(single, references[-1], atol=2e-3, rtol=2e-3)
+
+    def test_c3_c4_fail_closed_and_recover_on_non_default_stream(self):
+        input_tensor = torch.randn(
+            17, 128, device="cuda", dtype=torch.float16
+        ) * 0.05
+        weights = torch.randn(
+            2, 128, 128, device="cuda", dtype=torch.float16
+        ) * 0.05
+        biases = torch.randn(2, 128, device="cuda", dtype=torch.float32) * 0.05
+        misaligned_bias_storage = torch.empty(
+            2 * 128 + 1, device="cuda", dtype=torch.float32
+        )
+        misaligned_biases = misaligned_bias_storage[1:].view(2, 128)
+        with torch.no_grad():
+            with self.assertRaisesRegex(RuntimeError, "packed head_biases.*32-byte"):
+                _C.rasterize_gaussians_with_packed_heads(
+                    *self._packed_args(input_tensor, weights, misaligned_biases)
+                )
+            with self.assertRaisesRegex(RuntimeError, "packed worker_groups"):
+                _C.rasterize_gaussians_with_packed_heads(
+                    *self._packed_args(input_tensor, weights, biases, 3)
+                )
+
+        first_weight = weights[0]
+        first_bias = biases[0]
+        bad_tail_weight = torch.empty((0, 128), device="cuda")
+        bad_tail_bias = torch.empty((0,), device="cuda")
+        with torch.no_grad():
+            with self.assertRaisesRegex(RuntimeError, "1 <= O <= 128"):
+                _C.rasterize_gaussians_with_whole_heads(
+                    *self._whole_args(
+                        [input_tensor],
+                        [first_weight],
+                        [first_bias],
+                        [bad_tail_weight],
+                        [bad_tail_bias],
+                    )
+                )
+
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                valid = _C.rasterize_gaussians_with_packed_heads(
+                    *self._packed_args(input_tensor, weights, biases, 2, blocks=3)
+                )[-1]
+            stream.synchronize()
+        reference = torch.stack(
+            [
+                torch.nn.functional.linear(
+                    input_tensor.float(), weights[index].float(), biases[index]
+                )
+                for index in range(2)
+            ]
+        )
+        torch.testing.assert_close(valid, reference, atol=2e-3, rtol=2e-3)
+
+    def test_family_specific_resource_queries_and_mismatch_rejection(self):
+        for abi_version, family in (
+            (3, "packed_first_linear_v3"),
+            (4, "whole_heads_v4"),
+        ):
+            for worker_groups in range(1, 6):
+                resources = dict(
+                    _C.tacker_resource_requirements(
+                        abi_version, worker_groups, family
+                    )
+                )
+                self.assertEqual(resources["abi_version"], abi_version)
+                self.assertEqual(resources["backend_abi_version"], abi_version)
+                self.assertEqual(resources["backend_family"], family)
+                self.assertEqual(resources["family"], family)
+                self.assertEqual(
+                    resources["physical_threads"], 256 + worker_groups * 128
+                )
+                self.assertTrue(resources["launch_supported"])
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            _C.tacker_resource_requirements(3, 1, "whole_heads_v4")
 
 if __name__ == "__main__":
     unittest.main()

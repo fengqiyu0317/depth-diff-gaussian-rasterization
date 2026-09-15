@@ -56,6 +56,44 @@ namespace CudaRasterizer
 		int persistent_blocks;
 	};
 
+	// C3 uses tacker_ext's packed shared-input adapter.  All heads have the
+	// same row count and their weights/biases/outputs are contiguous along the
+	// leading head dimension.
+	struct MixedPackedHeadBundleV2
+	{
+		const void* input;
+		const void* weights;
+		const float* biases;
+		float* output;
+		int rows;
+		int head_count;
+		int worker_groups;
+		int persistent_blocks;
+	};
+
+	// C4 evaluates the complete Linear(128,128) -> ReLU -> Linear(128,O)
+	// head.  Tail widths may differ by task, so C4 retains task descriptors
+	// while sharing one physical Raster+backend CTA.
+	struct MixedWholeHeadTaskV2
+	{
+		const void* input;
+		const void* first_weight;
+		const float* first_bias;
+		const float* tail_weight;
+		const float* tail_bias;
+		float* output;
+		int rows;
+		int tail_features;
+	};
+
+	struct MixedWholeHeadBundleV2
+	{
+		MixedWholeHeadTaskV2 tasks[kMaxMixedHeadTasksV2];
+		int task_count;
+		int worker_groups;
+		int persistent_blocks;
+	};
+
 	class Rasterizer
 	{
 	public:
@@ -153,6 +191,39 @@ namespace CudaRasterizer
 			cudaStream_t stream,
 			const MixedHeadTask* mixed_head_v1,
 			const MixedHeadBundleV2* mixed_heads_v2);
+
+		// Family-aware mixed overload.  At most one backend descriptor may be
+		// non-null; the preceding overload remains source-compatible and routes
+		// to this one with C3/C4 disabled.
+		static int forward(
+			std::function<char* (size_t)> geometryBuffer,
+			std::function<char* (size_t)> binningBuffer,
+			std::function<char* (size_t)> imageBuffer,
+			const int P, int D, int M,
+			const float* background,
+			const int width, int height,
+			const float* means3D,
+			const float* shs,
+			const float* colors_precomp,
+			const float* opacities,
+			const float* scales,
+			const float scale_modifier,
+			const float* rotations,
+			const float* cov3D_precomp,
+			const float* viewmatrix,
+			const float* projmatrix,
+			const float* cam_pos,
+			const float tan_fovx, float tan_fovy,
+			const bool prefiltered,
+			float* out_color,
+			float* out_depth,
+			int* radii,
+			bool debug,
+			cudaStream_t stream,
+			const MixedHeadTask* mixed_head_v1,
+			const MixedHeadBundleV2* mixed_heads_v2,
+			const MixedPackedHeadBundleV2* mixed_packed_heads_v2,
+			const MixedWholeHeadBundleV2* mixed_whole_heads_v2);
 
 		static void backward(
 			const int P, int D, int M, int R,

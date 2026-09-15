@@ -10,6 +10,8 @@
  */
 
 #include <torch/extension.h>
+#include <stdexcept>
+#include <string>
 #include "rasterize_points.h"
 #include "cuda_rasterizer/tacker_mixed.h"
 
@@ -70,15 +72,118 @@ py::dict TackerCapabilities() {
   capabilities["supported_worker_groups"] = supported_worker_groups;
   capabilities["mixed_threads_by_worker_groups"] = threads_by_worker_groups;
   capabilities["resource_query"] = "tacker_resource_requirements";
+  capabilities["resource_query_family_aware"] = true;
+
+  capabilities["mixed_render_packed_heads_abi"] =
+      CudaRasterizer::Tacker::kMixedPackedAbiVersion;
+  capabilities["mixed_render_packed_heads"] = true;
+  capabilities["mixed_packed_family"] = "packed_first_linear_v3";
+  capabilities["mixed_packed_symbol"] =
+      "tacker_mix_render_packed_heads_v3";
+  capabilities["mixed_packed_manifest"] =
+      "abi/tacker_mixed_render_packed_heads_v3.json";
+  capabilities["mixed_packed_manifest_sha256"] =
+      "c98ed90853308179443146d3022e5da072c4f507975193f7a01f4fbe4400cf40";
+  capabilities["mixed_packed_head_manifest_sha256"] =
+      "9d6a1558acd6b642b975bcabe22abcbe3fd7242e4c9e0d635636ef4d2eb5da7f";
+
+  capabilities["mixed_render_whole_heads_abi"] =
+      CudaRasterizer::Tacker::kMixedWholeHeadAbiVersion;
+  capabilities["mixed_render_whole_heads"] = true;
+  capabilities["mixed_whole_family"] = "whole_heads_v4";
+  capabilities["mixed_whole_symbol"] =
+      "tacker_mix_render_whole_heads_v4";
+  capabilities["mixed_whole_manifest"] =
+      "abi/tacker_mixed_render_whole_heads_v4.json";
+  capabilities["mixed_whole_manifest_sha256"] =
+      "293b8471fc9397070f1d1ebbe1297420f24f49e6882369e2e6cf8dcd9d49b7a1";
+  capabilities["mixed_whole_head_manifest_sha256"] =
+      "9d6a1558acd6b642b975bcabe22abcbe3fd7242e4c9e0d635636ef4d2eb5da7f";
+  capabilities["whole_head_tail_features_min"] = 1;
+  capabilities["whole_head_tail_features_max"] =
+      CudaRasterizer::Tacker::kMaxTailFeaturesV2;
+  capabilities["whole_head_scratch_bytes_per_worker_group"] =
+      128 * static_cast<int>(sizeof(float));
+  capabilities["whole_head_named_barriers_per_worker_group"] = 1;
+  capabilities["whole_head_barrier_base_id"] =
+      CudaRasterizer::Tacker::kWholeHeadBarrierBaseIdV2;
+  capabilities["whole_head_descriptor_named_barrier_id"] =
+      CudaRasterizer::Tacker::kWholeHeadDescriptorBarrierIdV2;
+  py::list supported_backend_families;
+  supported_backend_families.append("first_linear_heads_v2");
+  supported_backend_families.append("packed_first_linear_v3");
+  supported_backend_families.append("whole_heads_v4");
+  capabilities["supported_backend_families"] = supported_backend_families;
+  py::list supported_mixed_abis;
+  for (int abi_version = CudaRasterizer::Tacker::kMixedAbiVersion;
+       abi_version <= CudaRasterizer::Tacker::kMixedWholeHeadAbiVersion;
+       ++abi_version) {
+    supported_mixed_abis.append(abi_version);
+  }
+  capabilities["supported_mixed_abis"] = supported_mixed_abis;
   return capabilities;
 }
 
-py::dict TackerResourceRequirements(int abi_version, int worker_groups) {
+CudaRasterizer::Tacker::MixedBackendFamily ParseBackendFamily(
+    int abi_version,
+    const std::string& family) {
+  if (family.empty()) {
+    if (abi_version == CudaRasterizer::Tacker::kMixedAbiVersion ||
+        abi_version == CudaRasterizer::Tacker::kMixedMultiAbiVersion) {
+      return CudaRasterizer::Tacker::MixedBackendFamily::FirstLinear;
+    }
+    if (abi_version == CudaRasterizer::Tacker::kMixedPackedAbiVersion) {
+      return CudaRasterizer::Tacker::MixedBackendFamily::PackedFirstLinear;
+    }
+    if (abi_version == CudaRasterizer::Tacker::kMixedWholeHeadAbiVersion) {
+      return CudaRasterizer::Tacker::MixedBackendFamily::WholeHead;
+    }
+    throw std::invalid_argument("unsupported mixed ABI version");
+  }
+  if ((family == "first_linear_head_v1" &&
+       abi_version == CudaRasterizer::Tacker::kMixedAbiVersion) ||
+      (family == "first_linear_heads_v2" &&
+       abi_version == CudaRasterizer::Tacker::kMixedMultiAbiVersion)) {
+    return CudaRasterizer::Tacker::MixedBackendFamily::FirstLinear;
+  }
+  if (family == "packed_first_linear_v3" &&
+      abi_version == CudaRasterizer::Tacker::kMixedPackedAbiVersion) {
+    return CudaRasterizer::Tacker::MixedBackendFamily::PackedFirstLinear;
+  }
+  if (family == "whole_heads_v4" &&
+      abi_version == CudaRasterizer::Tacker::kMixedWholeHeadAbiVersion) {
+    return CudaRasterizer::Tacker::MixedBackendFamily::WholeHead;
+  }
+  throw std::invalid_argument(
+      "backend family does not match the requested mixed ABI version");
+}
+
+const char* ResourceBackendFamily(
+    int abi_version,
+    CudaRasterizer::Tacker::MixedBackendFamily family) {
+  if (abi_version == CudaRasterizer::Tacker::kMixedAbiVersion &&
+      family == CudaRasterizer::Tacker::MixedBackendFamily::FirstLinear) {
+    return "first_linear_head_v1";
+  }
+  return CudaRasterizer::Tacker::mixedBackendFamilyName(family);
+}
+
+py::dict TackerResourceRequirements(
+    int abi_version,
+    int worker_groups,
+    const std::string& family) {
+  const CudaRasterizer::Tacker::MixedBackendFamily parsed_family =
+      ParseBackendFamily(abi_version, family);
   const CudaRasterizer::Tacker::MixedKernelResources resources =
       CudaRasterizer::Tacker::queryMixedKernelResources(
-          abi_version, worker_groups);
+          abi_version, worker_groups, parsed_family);
   py::dict result;
   result["abi_version"] = resources.abi_version;
+  result["backend_abi_version"] = resources.abi_version;
+  result["backend_family"] =
+      ResourceBackendFamily(resources.abi_version, resources.backend_family);
+  result["family"] =
+      ResourceBackendFamily(resources.abi_version, resources.backend_family);
   result["worker_groups"] = resources.worker_groups;
   result["physical_threads"] = resources.physical_threads;
   result["device_ordinal"] = resources.device_ordinal;
@@ -117,6 +222,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "rasterize_gaussians_with_heads",
       &RasterizeGaussiansWithHeadsCUDA,
       "Inference-only physical Raster+1--5 first-linear heads mixed kernel");
+  m.def(
+      "rasterize_gaussians_with_packed_heads",
+      &RasterizeGaussiansWithPackedHeadsCUDA,
+      "Inference-only physical Raster+packed first-linear heads mixed kernel");
+  m.def(
+      "rasterize_gaussians_with_whole_head",
+      &RasterizeGaussiansWithWholeHeadCUDA,
+      "Inference-only physical Raster+one complete head mixed kernel");
+  m.def(
+      "rasterize_gaussians_with_whole_heads",
+      &RasterizeGaussiansWithWholeHeadsCUDA,
+      "Inference-only physical Raster+1--5 complete heads mixed kernel");
   m.def("rasterize_gaussians_backward", &RasterizeGaussiansBackwardCUDA);
   m.def("mark_visible", &markVisible);
   m.def("tacker_capabilities", &TackerCapabilities);
@@ -125,5 +242,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       &TackerResourceRequirements,
       py::arg("abi_version") = CudaRasterizer::Tacker::kMixedMultiAbiVersion,
       py::arg("worker_groups") = 1,
-      "Query active-device registers, shared memory, and occupancy");
+      py::arg("family") = "",
+      "Query active-device family-specific registers, shared memory, and occupancy");
 }
